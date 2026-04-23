@@ -1,21 +1,64 @@
 from PyQt5.QtWidgets import (
     QFileDialog, QGraphicsScene, QGraphicsPixmapItem,
     QButtonGroup, QListWidgetItem,
-    QTableWidgetItem, QHeaderView, QMenu, QMessageBox, QDialog
+    QTableWidgetItem, QHeaderView, QMenu, QMessageBox, QDialog,
+    QCheckBox, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox
 )
 from PyQt5.QtGui import QPixmap, QPen, QCursor
 from PyQt5.QtCore import Qt, QEvent, QObject, QSize
 from Model.Proyecto import Proyecto
 from Model.ExportadorDB import ExportadorDB
-from Model.ExportadorCSV import ExportadorCSV 
+from Model.ExportadorCSV import ExportadorCSV
+from Model.stcm_parser import parse_stcm, STCMData
 from Controller.mover_controller import MoverController
 from Controller.colocar_controller import ColocarController
 from Controller.ruta_controller import RutaController
 from View.view import NodoListItemWidget, RutaListItemWidget
 from View.node_item import NodoItem
+from Model.Nodo import Nodo
+from Model.schema import NODO_FIELDS, OBJETIVO_FIELDS
 import ast
 import copy
-from Model.schema import NODO_FIELDS, OBJETIVO_FIELDS
+
+
+class _ComboObjetivoSinFlechas(QComboBox):
+    """QComboBox que ignora flechas (Up/Down/Left/Right) y PageUp/PageDown
+    mientras el popup está cerrado. Permite navegar la tabla con el teclado
+    sin disparar accidentalmente el cambio de objetivo y la apertura del
+    diálogo de propiedades avanzadas. Cuando el popup está abierto, las
+    flechas funcionan normalmente para elegir un ítem."""
+
+    def keyPressEvent(self, event):
+        if not self.view().isVisible():
+            tecla = event.key()
+            if tecla in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right,
+                         Qt.Key_PageUp, Qt.Key_PageDown):
+                event.ignore()
+                return
+        super().keyPressEvent(event)
+
+
+class _PropertiesTableEnterFilter(QObject):
+    """Filtro de eventos para la tabla de propiedades. Cuando el usuario
+    presiona Enter/Return sobre una celda cuyo valor es un QComboBox
+    (p.ej. el combo de 'objetivo'), abre su popup en vez de iniciar
+    edición de la celda. Así se puede navegar la tabla con flechas y
+    abrir el desplegable con Enter."""
+
+    def __init__(self, table, parent=None):
+        super().__init__(parent)
+        self._table = table
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            row = self._table.currentRow()
+            if row >= 0:
+                widget = self._table.cellWidget(row, 1)
+                if isinstance(widget, QComboBox):
+                    widget.showPopup()
+                    return True
+        return False
+
 
 class EditorController(QObject):
     def __init__(self, view, proyecto=None):
@@ -25,6 +68,13 @@ class EditorController(QObject):
         
         # --- ESCALA GLOBAL: 1 píxel = 0.05 metros ---
         self.ESCALA = 0.05
+
+        # --- Dimensiones del mapa en píxeles (para invertir eje Y y limitar escena) ---
+        self.alto_mapa_px = 0
+        self.ancho_mapa_px = 0
+        # Offset del origen: esquina inferior izquierda del área blanca del mapa
+        self.offset_x_px = 0
+        self.offset_y_px = 0  # En coordenadas de pantalla (Y crece hacia abajo)
 
         # --- NUEVO: Estado del cursor ---
         self._cursor_sobre_nodo = False
@@ -46,16 +96,43 @@ class EditorController(QObject):
         header = self.view.propertiesTable.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
 
+        # --- Etiqueta de nodo seleccionado arriba de la tabla de propiedades ---
+        self.lbl_nodo_seleccionado = QLabel("")
+        self.lbl_nodo_seleccionado.setStyleSheet("""
+            QLabel {
+                background-color: #2D2D30;
+                color: #FFFFFF;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 6px 10px;
+                border: 1px solid #3F3F46;
+                border-radius: 4px;
+                margin-bottom: 4px;
+            }
+        """)
+        self.lbl_nodo_seleccionado.setAlignment(Qt.AlignCenter)
+        self.lbl_nodo_seleccionado.hide()
+        # Insertar antes de la tabla (posición 0 del layout)
+        self.view.groupProperties.layout().insertWidget(0, self.lbl_nodo_seleccionado)
+
         # --- Menú Proyecto ---
+        nueva_ventana_action = self.view.menuProyecto.addAction("Nueva ventana")
+        nueva_ventana_action.triggered.connect(self._abrir_nueva_ventana)
+        self.view.menuProyecto.addSeparator()
         nuevo_action = self.view.menuProyecto.addAction("Nuevo")
         abrir_action = self.view.menuProyecto.addAction("Abrir")
         guardar_action = self.view.menuProyecto.addAction("Guardar")
-        
+        guardar_como_action = self.view.menuProyecto.addAction("Guardar como...")
+        importar_action = self.view.menuProyecto.addAction("Importar proyecto...")
+        importar_action.triggered.connect(self.importar_proyecto)
+        cerrar_action = self.view.menuProyecto.addAction("Cerrar proyecto")
+        cerrar_action.triggered.connect(self.cerrar_proyecto)
+
         # --- Submenú Exportar ---
         self.view.menuProyecto.addSeparator()  # Separador visual
         exportar_sqlite_action = self.view.menuProyecto.addAction("Exportar a SQLite...")
         exportar_sqlite_action.triggered.connect(self.exportar_a_sqlite)
-        
+
         # --- Opción para exportar a CSV ---
         exportar_csv_action = self.view.menuProyecto.addAction("Exportar a CSV...")
         exportar_csv_action.triggered.connect(self.exportar_a_csv)
@@ -63,6 +140,10 @@ class EditorController(QObject):
         nuevo_action.triggered.connect(self.nuevo_proyecto)
         abrir_action.triggered.connect(self.abrir_proyecto)
         guardar_action.triggered.connect(self.guardar_proyecto)
+        guardar_como_action.triggered.connect(self.guardar_proyecto_como)
+
+        # Interceptar cierre de ventana (botón X)
+        self.view.on_close_callback = self._on_close_window
 
         # --- Subcontroladores---
         self.mover_ctrl = MoverController(self.proyecto, self.view, self)
@@ -107,9 +188,13 @@ class EditorController(QObject):
         self.modo_group.addButton(self.view.mover_button)
         self.modo_group.addButton(self.view.colocar_vertice_button)
         self.modo_group.addButton(self.view.crear_ruta_button)
+        if hasattr(self.view, "duplicar_nodo_button"):
+            self.modo_group.addButton(self.view.duplicar_nodo_button)
 
         self.modo_group.buttonClicked.connect(self.cambiar_modo)
         self.modo_actual = None
+        self.ruta_archivo_actual = None  # Ruta del archivo JSON del proyecto abierto
+        self.proyecto_modificado = False  # Flag de cambios sin guardar
 
         # Estado inicial: modo por defecto (navegación)
         self.view.marco_trabajo.setDragMode(self.view.marco_trabajo.ScrollHandDrag)
@@ -118,6 +203,7 @@ class EditorController(QObject):
 
         self._changing_selection = False
         self._updating_ui = False
+        self._updating_from_table = False
 
         # mantener referencias a las líneas de rutas dibujadas
         self._route_lines = []            
@@ -131,6 +217,14 @@ class EditorController(QObject):
 
         # Instalar filtro de eventos en la ventana principal para manejo de teclado
         self.view.installEventFilter(self)
+
+        # Filtro para que Enter sobre una celda con QComboBox abra su popup
+        # (permite usar el combo de objetivo navegando con flechas + Enter).
+        if hasattr(self.view, "propertiesTable"):
+            self._props_enter_filter = _PropertiesTableEnterFilter(
+                self.view.propertiesTable, self
+            )
+            self.view.propertiesTable.installEventFilter(self._props_enter_filter)
 
         if hasattr(self.view, "rutasList"):
             try:
@@ -176,6 +270,18 @@ class EditorController(QObject):
         
         # --- NUEVO: Actualizar descripción del modo inicial ---
         self.actualizar_descripcion_modo()
+
+        # --- Estado del modo de duplicación (botón "Duplicar nodo") ---
+        # El modo tiene dos fases dentro del mismo botón:
+        # 1. Selección: el usuario hace click en nodos para añadirlos a la lista
+        #    a duplicar (click nuevamente los quita). Ctrl no es necesario.
+        # 2. Colocación: mientras hay nodos seleccionados y el cursor está sobre
+        #    una zona vacía, se muestran "fantasmas" siguiendo al cursor. Un
+        #    click en zona vacía coloca los duplicados y limpia la selección
+        #    para poder continuar duplicando.
+        self._modo_duplicar_activo = False
+        self._duplicar_items_seleccionados = []  # NodoItems marcados para duplicar
+        self._duplicar_ghost_items = []  # Lista de (ellipse, dx, dy)
 
         # Asegurar que el cursor inicial sea correcto
         self._actualizar_cursor()
@@ -234,7 +340,6 @@ class EditorController(QObject):
             # Mover puntero a la última posición
             self.indice_historial = len(self.historial_movimientos) - 1
             
-            print(f"✓ Eliminación registrada en historial: Nodo ID {nodo_copia.get('id')}")
             
         except Exception as e:
             print(f"Error registrando eliminación en historial: {e}")
@@ -243,16 +348,41 @@ class EditorController(QObject):
     def pixeles_a_metros(self, valor_px):
         """Convierte píxeles a metros usando la escala global."""
         return valor_px * self.ESCALA
-    
+
     def metros_a_pixeles(self, valor_m):
         """Convierte metros a píxeles usando la escala global."""
         return valor_m / self.ESCALA
-    
+
+    def x_px_a_metros(self, x_px):
+        """Convierte X de píxeles a metros, restando el offset del origen."""
+        return (x_px - self.offset_x_px) * self.ESCALA
+
+    def x_metros_a_px(self, x_m):
+        """Convierte X de metros a píxeles, sumando el offset del origen."""
+        return (x_m / self.ESCALA) + self.offset_x_px
+
+    def y_px_a_metros(self, y_px):
+        """Convierte Y de píxeles (crece hacia abajo) a metros (crece hacia arriba), desde el offset."""
+        return (self.offset_y_px - y_px) * self.ESCALA
+
+    def y_metros_a_px(self, y_m):
+        """Convierte Y de metros (crece hacia arriba) a píxeles (crece hacia abajo), desde el offset."""
+        return self.offset_y_px - (y_m / self.ESCALA)
+
     def format_coords_m(self, x_px, y_px):
         """Formatea coordenadas en metros con 2 decimales."""
-        x_m = self.pixeles_a_metros(x_px)
-        y_m = self.pixeles_a_metros(y_px)
+        x_m = self.x_px_a_metros(x_px)
+        y_m = self.y_px_a_metros(y_px)
         return f"{x_m:.2f}, {y_m:.2f}"
+
+    def _limpiar_propiedades(self):
+        """Limpia la tabla de propiedades y oculta la etiqueta de nodo."""
+        self.view.propertiesTable.clear()
+        self.view.propertiesTable.setRowCount(0)
+        self.view.propertiesTable.setColumnCount(2)
+        self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
+        if hasattr(self, 'lbl_nodo_seleccionado'):
+            self.lbl_nodo_seleccionado.hide()
 
     # --- MÉTODOS PARA GESTIÓN DE PUNTEROS ---
     def _actualizar_cursor(self, cursor_tipo=None):
@@ -264,13 +394,10 @@ class EditorController(QObject):
         """
         try:
             # Depuración para entender qué está pasando
-            debug_info = f"DEBUG Cursor: modo={self.modo_actual}, sobre_nodo={self._cursor_sobre_nodo}, arrastrando={self._arrastrando_nodo}"
-            print(debug_info)
             
             if cursor_tipo is not None:
                 # Si se especifica un cursor específico, usarlo
                 self.view.marco_trabajo.viewport().setCursor(QCursor(cursor_tipo))
-                print(f"Cursor forzado a: {cursor_tipo}")
                 return
             
             # Determinar cursor según el modo actual y estado
@@ -279,11 +406,9 @@ class EditorController(QObject):
                 if self._cursor_sobre_nodo:
                     # ABSOLUTAMENTE SIEMPRE PointingHandCursor cuando está sobre un nodo
                     cursor = Qt.PointingHandCursor
-                    print("MODO POR DEFECTO: PointingHandCursor (sobre nodo)")
                 else:
                     # Dejar que Qt maneje el cursor de navegación (ScrollHandDrag)
                     self.view.marco_trabajo.viewport().unsetCursor()
-                    print("MODO POR DEFECTO: Cursor por defecto de Qt")
                     return
                     
             elif self.modo_actual == "mover":
@@ -291,36 +416,29 @@ class EditorController(QObject):
                 if self._arrastrando_nodo:
                     # Mano cerrada cuando se está arrastrando un nodo
                     cursor = Qt.ClosedHandCursor
-                    print("MODO MOVER: ClosedHandCursor (arrastrando nodo)")
                 elif self._cursor_sobre_nodo:
                     # PointingHandCursor cuando está sobre un nodo pero NO arrastrando
                     cursor = Qt.PointingHandCursor
-                    print("MODO MOVER: PointingHandCursor (sobre nodo, no arrastrando)")
                 else:
                     # Flecha cuando no está sobre un nodo
                     cursor = Qt.ArrowCursor
-                    print("MODO MOVER: ArrowCursor (no sobre nodo)")
                     
             elif self.modo_actual == "colocar":
                 # MODO COLOCAR VÉRTICE - SIEMPRE flecha
                 cursor = Qt.ArrowCursor
-                print("MODO COLOCAR: ArrowCursor")
                 
             elif self.modo_actual == "ruta":
                 # MODO RUTA - AHORA IGUAL QUE MODO MOVER (sin arrastre)
                 if self._cursor_sobre_nodo:
                     # PointingHandCursor cuando está sobre un nodo
                     cursor = Qt.PointingHandCursor
-                    print("MODO RUTA: PointingHandCursor (sobre nodo)")
                 else:
                     # Flecha cuando no está sobre un nodo
                     cursor = Qt.ArrowCursor
-                    print("MODO RUTA: ArrowCursor (no sobre nodo)")
                     
             else:
                 # Cualquier otro modo
                 cursor = Qt.ArrowCursor
-                print("MODO DESCONOCIDO: ArrowCursor")
             
             # Aplicar el cursor
             self.view.marco_trabajo.viewport().setCursor(QCursor(cursor))
@@ -332,52 +450,25 @@ class EditorController(QObject):
     def nodo_hover_entered(self, nodo_item):
         """Cuando el ratón entra en un nodo"""
         self._cursor_sobre_nodo = True
-        print(f"HOVER ENTRADO: Nodo ID {nodo_item.nodo.get('id')}")
         self._actualizar_cursor()
 
     def nodo_hover_leaved(self, nodo_item):
         """Cuando el ratón sale de un nodo"""
         self._cursor_sobre_nodo = False
-        print(f"HOVER SALIDO: Nodo ID {nodo_item.nodo.get('id')}")
         self._actualizar_cursor()
 
     def nodo_arrastre_iniciado(self):
         """Cuando se inicia el arrastre de un nodo en modo mover"""
         if self.modo_actual == "mover":
             self._arrastrando_nodo = True
-            print("ARRASRE INICIADO: Mano cerrada")
             self._actualizar_cursor()
 
     def nodo_arrastre_terminado(self):
         """Cuando se termina el arrastre de un nodo"""
         self._arrastrando_nodo = False
-        print("ARRASRE TERMINADO: Mano apuntando")
         self._actualizar_cursor()
 
     # --- MÉTODOS NUEVOS PARA MANEJO DE PROYECTO ---
-    def _actualizar_referencias_proyecto(self, proyecto):
-        """Actualiza todas las referencias al proyecto en controladores y subcontroladores"""
-        self.proyecto = proyecto
-        
-        # Actualizar en subcontroladores
-        self.mover_ctrl.proyecto = proyecto
-        self.colocar_ctrl.proyecto = proyecto
-        self.ruta_ctrl.proyecto = proyecto
-        
-        # IMPORTANTE: Resetear el estado de los subcontroladores
-        if self.modo_actual:
-            self._resetear_modo_actual()
-        
-        # Asegurar que todos los nodos tienen el campo es_cargador
-        for nodo in self.proyecto.nodos:
-            if isinstance(nodo, dict):
-                if "es_cargador" not in nodo:
-                    nodo["es_cargador"] = 0  # Valor por defecto
-            elif not hasattr(nodo, "es_cargador"):
-                setattr(nodo, "es_cargador", 0)
-        
-        print("✓ Referencias del proyecto actualizadas en todos los controladores")
-
     def _resetear_modo_actual(self):
         """Resetea el modo actual para forzar reconfiguración"""
         modo_temp = self.modo_actual
@@ -413,11 +504,8 @@ class EditorController(QObject):
             self.view.rutasList.clear()
         
         # Limpiar tabla de propiedades
-        self.view.propertiesTable.clear()
-        self.view.propertiesTable.setRowCount(0)
-        self.view.propertiesTable.setColumnCount(2)
-        self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
-        
+        self._limpiar_propiedades()
+
         # Limpiar líneas de ruta
         self._clear_route_lines()
         self._clear_highlight_lines()
@@ -426,6 +514,7 @@ class EditorController(QObject):
         self.ruta_actual_idx = None
         self._changing_selection = False
         self._updating_ui = False
+        self._updating_from_table = False
         
         # Limpiar historial cuando se crea/abre un nuevo proyecto
         self._limpiar_historial()
@@ -442,7 +531,6 @@ class EditorController(QObject):
             self.view.btnMostrarTodo.setText("Ocultar Rutas")
             self.view.btnMostrarTodo.setEnabled(True)  # Habilitado inicialmente
         
-        print("✓ UI completamente limpiada para nuevo proyecto")
 
     # +++ NUEVOS MÉTODOS PARA PARÁMETROS +++
     def mostrar_dialogo_parametros(self):
@@ -462,9 +550,9 @@ class EditorController(QObject):
                 self.proyecto.parametros = {}
             
             self.proyecto.parametros = nuevos_parametros
-            
-            print("Parámetros guardados:", nuevos_parametros)
-            QMessageBox.information(self.view, "Parámetros", 
+            self.proyecto_modificado = True
+
+            QMessageBox.information(self.view, "Parámetros",
                                   "Parámetros guardados correctamente.")
     
     def mostrar_dialogo_parametros_playa(self):
@@ -484,9 +572,9 @@ class EditorController(QObject):
                 self.proyecto.parametros_playa = {}
             
             self.proyecto.parametros_playa = nuevos_parametros
-            
-            print("Parámetros de playa guardados:", nuevos_parametros)
-            QMessageBox.information(self.view, "Parámetros Playa", 
+            self.proyecto_modificado = True
+
+            QMessageBox.information(self.view, "Parámetros Playa",
                                   "Parámetros de playa guardados correctamente.")
 
     def mostrar_dialogo_parametros_carga_descarga(self):
@@ -506,23 +594,24 @@ class EditorController(QObject):
                 self.proyecto.parametros_carga_descarga = {}
             
             self.proyecto.parametros_carga_descarga = nuevos_parametros
-            
-            print("Parámetros de carga/descarga guardados:", nuevos_parametros)
-            QMessageBox.information(self.view, "Parámetros Carga/Descarga", 
+            self.proyecto_modificado = True
+
+            QMessageBox.information(self.view, "Parámetros Carga/Descarga",
                                 "Parámetros de carga/descarga guardados correctamente.")
 
 
     # --- Gestión de modos ---
     def cambiar_modo(self, boton):
-        print(f"\n=== CAMBIANDO MODO: boton={boton.text()} ===")
         
         # Si el botón ya estaba activado y se hace clic, se desactiva
         if not boton.isChecked():
-            print("Desactivando todos los modos...")
             # Desactivar todos los modos
             self.modo_actual = None
             self.mover_ctrl.desactivar()
             self.colocar_ctrl.desactivar()
+            # Salir de modo duplicar si estaba activo
+            if getattr(self, "_modo_duplicar_activo", False):
+                self._salir_modo_duplicar()
             
             # IMPORTANTE: Desconectar señales de movimiento
             try:
@@ -530,7 +619,7 @@ class EditorController(QObject):
                     if isinstance(item, NodoItem):
                         try:
                             item.moved.disconnect()
-                        except:
+                        except Exception:
                             pass
             except Exception:
                 pass
@@ -556,7 +645,6 @@ class EditorController(QObject):
             # Restaurar colores normales de nodos
             self.restaurar_colores_nodos()
             
-            print("Modo por defecto activado: navegación del mapa y selección")
             
             # --- NUEVO: Actualizar descripción del modo ---
             self.actualizar_descripcion_modo()
@@ -564,19 +652,26 @@ class EditorController(QObject):
             # --- NUEVO: Resetear estado de arrastre y actualizar cursor ---
             self._arrastrando_nodo = False
             self._cursor_sobre_nodo = False
-            print("Reset estados cursor: arrastrando=False, sobre_nodo=False")
             self._actualizar_cursor()
             
             return
 
         # Desactivar los otros botones
-        for b in (self.view.mover_button, self.view.colocar_vertice_button, 
-                self.view.crear_ruta_button):
+        otros_botones = [self.view.mover_button, self.view.colocar_vertice_button,
+                         self.view.crear_ruta_button]
+        if hasattr(self.view, "duplicar_nodo_button"):
+            otros_botones.append(self.view.duplicar_nodo_button)
+        for b in otros_botones:
             if b is not boton:
                 b.setChecked(False)
 
+        # Si cambiamos a un modo distinto de duplicar, salir del modo duplicar
+        if getattr(self, "_modo_duplicar_activo", False) and \
+                (not hasattr(self.view, "duplicar_nodo_button")
+                 or boton is not self.view.duplicar_nodo_button):
+            self._salir_modo_duplicar()
+
         if boton == self.view.mover_button:
-            print("Activando modo MOVER...")
             # --- MODO MOVER ---
             self.modo_actual = "mover"
             self.mover_ctrl.activar()
@@ -600,7 +695,6 @@ class EditorController(QObject):
                     except Exception:
                         pass
 
-            print("Modo Mover activado: nodos arrastrables, mapa fijo")
             
             # --- NUEVO: Actualizar descripción del modo ---
             self.actualizar_descripcion_modo("mover")
@@ -608,11 +702,9 @@ class EditorController(QObject):
             # --- NUEVO: Resetear estado de arrastre y actualizar cursor ---
             self._arrastrando_nodo = False
             self._cursor_sobre_nodo = False
-            print("Reset estados cursor: arrastrando=False, sobre_nodo=False")
             self._actualizar_cursor()
 
         elif boton == self.view.colocar_vertice_button:
-            print("Activando modo COLOCAR...")
             # --- MODO COLOCAR ---
             self.modo_actual = "colocar"
             self.colocar_ctrl.activar()
@@ -626,7 +718,6 @@ class EditorController(QObject):
             
             self.view.marco_trabajo.setDragMode(self.view.marco_trabajo.NoDrag)
             
-            print("Modo Colocar activado: añadir nuevos nodos")
             
             # --- NUEVO: Actualizar descripción del modo ---
             self.actualizar_descripcion_modo("colocar")
@@ -634,11 +725,30 @@ class EditorController(QObject):
             # --- NUEVO: Resetear estado de arrastre y actualizar cursor ---
             self._arrastrando_nodo = False
             self._cursor_sobre_nodo = False
-            print("Reset estados cursor: arrastrando=False, sobre_nodo=False")
+            self._actualizar_cursor()
+
+        elif hasattr(self.view, "duplicar_nodo_button") and boton == self.view.duplicar_nodo_button:
+            # --- MODO DUPLICAR ---
+            if not self.proyecto:
+                print("✗ ERROR: No hay proyecto cargado. Crea o abre un proyecto primero.")
+                boton.setChecked(False)
+                QMessageBox.warning(self.view, "Error",
+                                    "No hay proyecto cargado. Crea o abre un proyecto primero.")
+                return
+            self.modo_actual = "duplicar"
+            self.mover_ctrl.desactivar()
+            self.colocar_ctrl.desactivar()
+            try:
+                self.ruta_ctrl.desactivar()
+            except Exception:
+                pass
+            self.view.marco_trabajo.setDragMode(self.view.marco_trabajo.NoDrag)
+            self._entrar_modo_duplicar()
+            self._arrastrando_nodo = False
+            self._cursor_sobre_nodo = False
             self._actualizar_cursor()
 
         elif boton == self.view.crear_ruta_button:
-            print("Activando modo RUTA...")
             # --- MODO RUTA ---
             self.modo_actual = "ruta"
             
@@ -650,7 +760,6 @@ class EditorController(QObject):
                                 "No hay proyecto cargado. Crea o abre un proyecto primero.")
                 return
                     
-            print("Activando modo ruta - El usuario puede crear nodos haciendo clic en el mapa")
             
             # Activar modo ruta
             self.ruta_ctrl.activar()
@@ -658,7 +767,6 @@ class EditorController(QObject):
             self.colocar_ctrl.desactivar()
             self.view.marco_trabajo.setDragMode(self.view.marco_trabajo.NoDrag)
             
-            print("Modo Ruta activado: crear rutas entre nodos")
             
             # --- NUEVO: Actualizar descripción del modo ---
             self.actualizar_descripcion_modo("ruta")
@@ -666,7 +774,6 @@ class EditorController(QObject):
             # --- NUEVO: Resetear estado de arrastre y actualizar cursor ---
             self._arrastrando_nodo = False
             self._cursor_sobre_nodo = False
-            print("Reset estados cursor: arrastrando=False, sobre_nodo=False")
             self._actualizar_cursor()
 
         # Actualizar líneas después de cambiar modo
@@ -700,7 +807,6 @@ class EditorController(QObject):
             try:
                 # Finalizar la ruta primero
                 self.ruta_ctrl.finalizar_ruta_con_enter()
-                print("✓ Ruta finalizada con Enter")
                 
                 # Desactivar el botón de ruta después de finalizar
                 self.view.crear_ruta_button.setChecked(False)
@@ -712,76 +818,77 @@ class EditorController(QObject):
                 
             except Exception as e:
                 print(f"Error al finalizar ruta con Enter: {e}")
-        else:
-            print("⚠ No estás en modo Ruta")
     
     def cancelar_ruta_actual(self):
-        """Cancela la creación de la ruta actual cuando se presiona Escape"""
+        """Cancela la creación de la ruta actual cuando se presiona Escape.
+        También sale del modo duplicar si está activo."""
         # En lugar de código específico para ruta, llamamos al método general
-        if self.modo_actual == "ruta":
+        if self.modo_actual in ("ruta", "duplicar"):
             self.cancelar_modo_actual()
-        else:
-            print("⚠ No estás en modo Ruta")
     
     def eliminar_nodo_seleccionado(self):
         """Elimina el nodo seleccionado cuando se presiona Suprimir, mostrando confirmación"""
         try:
-            # Verificar si hay nodos seleccionados en la escena
             seleccionados_escena = self.scene.selectedItems()
-            
-            # Verificar si hay nodos seleccionados en la lista lateral
             seleccionados_lista = self.view.nodosList.selectedItems()
-            
+
             nodo_a_eliminar = None
             nodo_item_a_eliminar = None
-            
-            # Prioridad: selección en la escena sobre selección en la lista
-            if seleccionados_escena:
-                for item in seleccionados_escena:
-                    if isinstance(item, NodoItem):
-                        nodo_a_eliminar = item.nodo
-                        nodo_item_a_eliminar = item
+
+            # 1) Buscar primero un NodoItem entre los seleccionados de la escena
+            for item in seleccionados_escena:
+                if isinstance(item, NodoItem):
+                    nodo_a_eliminar = item.nodo
+                    nodo_item_a_eliminar = item
+                    break
+
+            # 2) Si no hay nodo en la escena, mirar la lista lateral
+            #    (puede caer aquí cuando el usuario seleccionó por la lista
+            #    o cuando el nodo está oculto y no tiene NodoItem visible)
+            if nodo_a_eliminar is None and seleccionados_lista:
+                for it in seleccionados_lista:
+                    candidato = it.data(Qt.UserRole)
+                    if candidato is None:
+                        # Fallback: buscar por widget.nodo_id
+                        widget = self.view.nodosList.itemWidget(it)
+                        if widget and hasattr(widget, 'nodo_id'):
+                            candidato = self._obtener_nodo_actual(widget.nodo_id)
+                    if candidato is not None:
+                        nodo_a_eliminar = candidato
                         break
-            
-            # Si no hay selección en la escena, buscar en la lista lateral
-            elif seleccionados_lista:
-                for i in range(self.view.nodosList.count()):
-                    item = self.view.nodosList.item(i)
-                    if item.isSelected():
-                        nodo_a_eliminar = item.data(Qt.UserRole)
+
+            if nodo_a_eliminar is None:
+                # No hay nada que borrar — no mostramos error, simplemente salimos
+                return
+
+            nodo_id = nodo_a_eliminar.get('id')
+
+            reply = QMessageBox.question(
+                self.view,
+                "Confirmar eliminación",
+                f"¿Estás seguro de que quieres eliminar el nodo ID {nodo_id}?\n\n"
+                f"Esta acción eliminará el nodo y reconfigurará las rutas que lo contengan.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+
+            if reply != QMessageBox.Yes:
+                return
+
+            # Si todavía no tenemos un NodoItem (selección por lista), intentar
+            # localizarlo en la escena. Si tampoco está ahí, eliminar igual:
+            # eliminar_nodo() tolera nodo_item=None y limpia por id.
+            if nodo_item_a_eliminar is None:
+                for sit in self.scene.items():
+                    if isinstance(sit, NodoItem) and sit.nodo.get('id') == nodo_id:
+                        nodo_item_a_eliminar = sit
                         break
-            
-            # Si encontramos un nodo para eliminar
-            if nodo_a_eliminar:
-                nodo_id = nodo_a_eliminar.get('id')
-                
-                # Mostrar cuadro de confirmación
-                reply = QMessageBox.question(
-                    self.view,
-                    "Confirmar eliminación",
-                    f"¿Estás seguro de que quieres eliminar el nodo ID {nodo_id}?\n\n"
-                    f"Esta acción eliminará el nodo y reconfigurará las rutas que lo contengan.",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes  # <- CAMBIO AQUÍ: Yes es ahora el botón por defecto
-                )
-                
-                if reply == QMessageBox.Yes:
-                    print(f"✓ Eliminando nodo ID {nodo_id}")
-                    # Buscar el NodoItem en la escena
-                    for item in self.scene.items():
-                        if isinstance(item, NodoItem) and item.nodo.get('id') == nodo_id:
-                            nodo_item_a_eliminar = item
-                            break
-                    if nodo_item_a_eliminar:
-                        self.eliminar_nodo(nodo_a_eliminar, nodo_item_a_eliminar)
-                else:
-                    print("✗ Eliminación cancelada por el usuario")
-            else:
-                print("⚠ No hay nodo seleccionado para eliminar")
-                
+
+            self.eliminar_nodo(nodo_a_eliminar, nodo_item_a_eliminar)
+
         except Exception as e:
             print(f"Error al eliminar nodo: {e}")
-            QMessageBox.warning(self.view, "Error", 
+            QMessageBox.warning(self.view, "Error",
                             f"No se pudo eliminar el nodo:\n{str(e)}")
 
     def keyPressEvent(self, event):
@@ -819,11 +926,9 @@ class EditorController(QObject):
         Se llama cuando se presiona la tecla Escape.
         """
         try:
-            print(f"Cancelando modo actual: {self.modo_actual}")
             
             # Si ya estamos en modo navegación (None), no hacer nada
             if self.modo_actual is None:
-                print("Ya estamos en modo navegación")
                 return
             
             # Determinar qué botón está activo basado en el modo actual
@@ -831,11 +936,9 @@ class EditorController(QObject):
             
             if self.modo_actual == "mover":
                 boton_activo = self.view.mover_button
-                print("Cancelando modo Mover")
             
             elif self.modo_actual == "colocar":
                 boton_activo = self.view.colocar_vertice_button
-                print("Cancelando modo Colocar")
                 
                 # IMPORTANTE: Cancelar cualquier acción pendiente en modo colocar
                 try:
@@ -845,17 +948,20 @@ class EditorController(QObject):
             
             elif self.modo_actual == "ruta":
                 boton_activo = self.view.crear_ruta_button
-                print("Cancelando modo Ruta")
-                
+
                 # IMPORTANTE: Cancelar la ruta actual primero
                 try:
                     self.ruta_ctrl.cancelar_ruta_actual()
                 except Exception as e:
                     print(f"Error al cancelar ruta: {e}")
+
+            elif self.modo_actual == "duplicar":
+                if hasattr(self.view, "duplicar_nodo_button"):
+                    boton_activo = self.view.duplicar_nodo_button
+                # _salir_modo_duplicar se invoca desde cambiar_modo al desactivar
             
             # Desactivar el botón y cambiar al modo navegación
             if boton_activo and boton_activo.isChecked():
-                print(f"Desactivando botón: {boton_activo.text()}")
                 boton_activo.setChecked(False)
                 
                 # Llamar a cambiar_modo para realizar la desactivación completa
@@ -865,7 +971,6 @@ class EditorController(QObject):
             self._actualizar_cursor()
             
             # Mostrar mensaje de confirmación
-            print(f"✓ Modo cancelado. Regresando a navegación")
             
             # Actualizar descripción del modo
             self.actualizar_descripcion_modo("navegacion")
@@ -915,7 +1020,6 @@ class EditorController(QObject):
             # Mover puntero a la última posición
             self.indice_historial = len(self.historial_movimientos) - 1
             
-            print(f"✓ Cambio de propiedad registrado: Nodo {nodo_id}.{propiedad} = {valor_nuevo}")
             
         except Exception as e:
             print(f"Error registrando cambio de propiedad de nodo: {e}")
@@ -952,8 +1056,6 @@ class EditorController(QObject):
             # Actualizar el índice al nuevo elemento
             self.indice_historial = len(self.historial_movimientos) - 1
             
-            print(f"✓ Creación registrada en historial: Nodo ID {nodo.get('id')}")
-            print(f"  Índice actual: {self.indice_historial}, Historial total: {len(self.historial_movimientos)}")
             
         except Exception as e:
             print(f"Error registrando creación de nodo: {e}")
@@ -967,13 +1069,11 @@ class EditorController(QObject):
             nodo = accion['nodo']
             nodo_id = nodo.get('id')
             
-            print(f"Deshaciendo creación: Nodo ID {nodo_id}")
             
             # ANTES de eliminar: verificar si está en la secuencia de ruta
             en_secuencia_ruta = False
             if hasattr(self, 'ruta_ctrl') and self.ruta_ctrl.activo:
                 en_secuencia_ruta = self.ruta_ctrl.contiene_nodo_en_secuencia(nodo_id)
-                print(f"  Nodo en secuencia de ruta: {en_secuencia_ruta}")
             
             # Buscar el nodo en la escena y en el proyecto
             nodo_item_a_eliminar = None
@@ -1000,19 +1100,17 @@ class EditorController(QObject):
             
             # DESPUÉS de eliminar: si estaba en secuencia de ruta, actualizar
             if en_secuencia_ruta:
-                print(f"  Actualizando secuencia de ruta después de eliminar nodo {nodo_id}")
                 self.ruta_ctrl.remover_nodo_de_secuencia(nodo_id)
                 
                 # Si después de remover no quedan nodos, limpiar estado
                 if not self.ruta_ctrl._nodes_seq:
-                    print("  ✓ Secuencia de ruta vaciada completamente")
+                    pass
                     # Restaurar colores de todos los nodos
                     self.restaurar_colores_nodos()
             
             # Decrementar índice del historial
             self.indice_historial -= 1
             
-            print(f"✓ Creación deshecha: Nodo ID {nodo_id} eliminado")
             
         except Exception as e:
             print(f"Error deshaciendo creación de nodo: {e}")
@@ -1034,7 +1132,6 @@ class EditorController(QObject):
             es_cargador = nodo.get('es_cargador', 0)
             angulo = nodo.get('A', 0)
             
-            print(f"Rehaciendo creación: Nodo ID {nodo_id} en ({x}, {y})")
             
             # Verificar si el nodo ya existe (no debería, pero por seguridad)
             nodo_existente = None
@@ -1044,7 +1141,7 @@ class EditorController(QObject):
                     break
             
             if nodo_existente:
-                print(f"Nodo ID {nodo_id} ya existe, no es necesario recrearlo")
+                pass
             else:
                 # Crear nuevo nodo en el proyecto (sin registrar en historial)
                 nuevo_nodo = {
@@ -1069,7 +1166,6 @@ class EditorController(QObject):
                 # Redibujar rutas si es necesario
                 self._dibujar_rutas()
                 
-                print(f"✓ Creación rehecha: Nodo ID {nodo_id} recreado")
             
             # IMPORTANTE: No necesitamos agregar a secuencia de ruta automáticamente
             # porque el usuario debe decidir si quiere añadirlo nuevamente a la ruta
@@ -1121,7 +1217,6 @@ class EditorController(QObject):
             # Mover puntero a la última posición
             self.indice_historial = len(self.historial_movimientos) - 1
             
-            print(f"✓ Cambio de propiedad registrado: Ruta {ruta_idx}.{propiedad}")
             
         except Exception as e:
             print(f"Error registrando cambio de propiedad de ruta: {e}")
@@ -1135,7 +1230,6 @@ class EditorController(QObject):
             propiedad = accion['propiedad']
             valor_anterior = accion['valor_anterior']
             
-            print(f"Deshaciendo cambio: Nodo {nodo_id}.{propiedad} = {valor_anterior}")
             
             # Buscar el nodo
             nodo = self.obtener_nodo_por_id(nodo_id)
@@ -1157,7 +1251,6 @@ class EditorController(QObject):
                         propiedad: valor_pixeles
                     })
                     
-                    print(f"✓ Cambio deshecho usando proyecto: Nodo {nodo_id}.{propiedad} = {valor_anterior} metros")
                     
                 except ValueError as e:
                     print(f"Error convirtiendo valor: {e}")
@@ -1168,7 +1261,6 @@ class EditorController(QObject):
                     propiedad: valor_anterior
                 })
                 
-                print(f"✓ Cambio deshecho usando proyecto: Nodo {nodo_id}.{propiedad} = {valor_anterior}")
             
             # Decrementar índice del historial
             self.indice_historial -= 1
@@ -1187,7 +1279,6 @@ class EditorController(QObject):
             propiedad = accion['propiedad']
             valor_nuevo = accion['valor_nuevo']
             
-            print(f"Rehaciendo cambio: Nodo {nodo_id}.{propiedad} = {valor_nuevo}")
             
             # Buscar el nodo
             nodo = self.obtener_nodo_por_id(nodo_id)
@@ -1209,7 +1300,6 @@ class EditorController(QObject):
                         propiedad: valor_pixeles
                     })
                     
-                    print(f"✓ Cambio rehecho usando proyecto: Nodo {nodo_id}.{propiedad} = {valor_nuevo} metros")
                     
                 except ValueError as e:
                     print(f"Error convirtiendo valor: {e}")
@@ -1220,7 +1310,6 @@ class EditorController(QObject):
                     propiedad: valor_nuevo
                 })
                 
-                print(f"✓ Cambio rehecho usando proyecto: Nodo {nodo_id}.{propiedad} = {valor_nuevo}")
             
         except Exception as e:
             print(f"Error rehaciendo cambio de propiedad de nodo: {e}")
@@ -1236,7 +1325,6 @@ class EditorController(QObject):
             propiedad = accion['propiedad']
             valor_anterior = accion['valor_anterior']
             
-            print(f"Deshaciendo cambio: Ruta {ruta_idx}.{propiedad} = {valor_anterior}")
             
             # Verificar que existe la ruta
             if ruta_idx >= len(self.proyecto.rutas):
@@ -1315,7 +1403,6 @@ class EditorController(QObject):
             # Decrementar índice del historial
             self.indice_historial -= 1
             
-            print(f"✓ Cambio deshecho: Ruta {ruta_idx}.{propiedad}")
             
         except Exception as e:
             print(f"Error deshaciendo cambio de propiedad de ruta: {e}")
@@ -1331,7 +1418,6 @@ class EditorController(QObject):
             propiedad = accion['propiedad']
             valor_nuevo = accion['valor_nuevo']
             
-            print(f"Rehaciendo cambio: Ruta {ruta_idx}.{propiedad} = {valor_nuevo}")
             
             # Verificar que existe la ruta
             if ruta_idx >= len(self.proyecto.rutas):
@@ -1407,7 +1493,6 @@ class EditorController(QObject):
             if self.ruta_actual_idx == ruta_idx:
                 self.mostrar_propiedades_ruta(ruta)
             
-            print(f"✓ Cambio rehecho: Ruta {ruta_idx}.{propiedad}")
             
         except Exception as e:
             print(f"Error rehaciendo cambio de propiedad de ruta: {e}")
@@ -1443,6 +1528,7 @@ class EditorController(QObject):
     
     def registrar_movimiento_finalizado(self, nodo_item, x_inicial, y_inicial, x_final, y_final):
         """Registra el final de un movimiento y lo agrega al historial"""
+        self.proyecto_modificado = True
         try:
             # Verificar que tenemos un movimiento en progreso
             if not self.movimiento_actual:
@@ -1490,7 +1576,6 @@ class EditorController(QObject):
             y_inicial_m = self.pixeles_a_metros(y_inicial)
             x_final_m = self.pixeles_a_metros(x_final)
             y_final_m = self.pixeles_a_metros(y_final)
-            print(f"Movimiento registrado: Nodo {nodo_id} de ({x_inicial_m:.2f},{y_inicial_m:.2f}) a ({x_final_m:.2f},{y_final_m:.2f}) metros")
             
         except Exception as e:
             print(f"Error registrando movimiento finalizado: {e}")
@@ -1502,7 +1587,6 @@ class EditorController(QObject):
     def deshacer_movimiento(self):
         """Deshace el último movimiento (Ctrl+Z)"""
         if self.indice_historial < 0:
-            print("No hay acciones para deshacer")
             return
             
         try:
@@ -1537,7 +1621,6 @@ class EditorController(QObject):
         # Mostrar en metros
         x_anterior_m = self.pixeles_a_metros(x_anterior)
         y_anterior_m = self.pixeles_a_metros(y_anterior)
-        print(f"Deshaciendo movimiento: Nodo {nodo_id} a ({x_anterior_m:.2f},{y_anterior_m:.2f}) metros")
         
         # Buscar el nodo en la escena
         nodo_encontrado = False
@@ -1568,7 +1651,6 @@ class EditorController(QObject):
         if nodo_encontrado:
             # Decrementar índice del historial
             self.indice_historial -= 1
-            print(f"Movimiento deshecho. Índice actual: {self.indice_historial}")
         else:
             print(f"Error: No se encontró el nodo {nodo_id}")
 
@@ -1582,7 +1664,6 @@ class EditorController(QObject):
             rutas_afectadas = eliminacion['rutas_afectadas']
             nodo_id = nodo.get('id')
             
-            print(f"Deshaciendo eliminación: Nodo ID {nodo_id}")
             
             # 1) Restaurar el nodo en el proyecto
             self.proyecto.nodos.append(nodo)
@@ -1631,8 +1712,6 @@ class EditorController(QObject):
             # 7) Decrementar índice del historial
             self.indice_historial -= 1
             
-            print(f"✓ Nodo ID {nodo_id} restaurado exitosamente")
-            print(f"  Rutas restauradas: {[r['indice'] for r in rutas_afectadas]}")
             
         except Exception as e:
             print(f"Error deshaciendo eliminación: {e}")
@@ -1675,7 +1754,6 @@ class EditorController(QObject):
             self._dibujar_rutas()
             self._actualizar_lista_rutas_con_widgets()
             
-            print(f"✓ Nodo ID {nodo_id} reeliminado (sin historial)")
             
         except Exception as e:
             print(f"Error en eliminación sin historial: {e}")
@@ -1689,7 +1767,6 @@ class EditorController(QObject):
             rutas_despues = eliminacion['rutas_despues']
             nodo_id = nodo.get('id')
             
-            print(f"Rehaciendo eliminación: Nodo ID {nodo_id}")
             
             # 1) RESTAURAR ESTADO COMPLETO DE LAS RUTAS
             self.proyecto.rutas = []
@@ -1724,8 +1801,6 @@ class EditorController(QObject):
             self._actualizar_lista_rutas_con_widgets()
             self._dibujar_rutas()
             
-            print(f"✓ Nodo ID {nodo_id} reeliminado exitosamente")
-            print(f"  Estado completo restaurado desde snapshot")
             
         except Exception as e:
             print(f"Error rehaciendo eliminación: {e}")
@@ -1742,7 +1817,6 @@ class EditorController(QObject):
         # Mostrar en metros
         x_nueva_m = self.pixeles_a_metros(x_nueva)
         y_nueva_m = self.pixeles_a_metros(y_nueva)
-        print(f"Rehaciendo movimiento: Nodo {nodo_id} a ({x_nueva_m:.2f},{y_nueva_m:.2f}) metros")
         
         # Buscar el nodo en la escena
         nodo_encontrado = False
@@ -1779,7 +1853,6 @@ class EditorController(QObject):
     def rehacer_movimiento(self):
         """Rehacer el movimiento deshecho (Ctrl+Y)"""
         if self.indice_historial >= len(self.historial_movimientos) - 1:
-            print("No hay acciones para rehacer")
             return
             
         try:
@@ -1833,68 +1906,158 @@ class EditorController(QObject):
             return False
 
     # --- FUNCIONES DE PROYECTO ---
-    
+
+    def _abrir_nueva_ventana(self):
+        """Lanza una nueva instancia independiente de la aplicación (sin proyecto)"""
+        self._abrir_en_nueva_ventana(None)
+
+    def _abrir_en_nueva_ventana(self, ruta_archivo=None):
+        """Lanza una nueva instancia de la app, opcionalmente con un proyecto"""
+        import subprocess
+        import sys
+        from pathlib import Path
+        main_py = str(Path(__file__).resolve().parent.parent / "main.py")
+        cmd = [sys.executable, main_py]
+        if ruta_archivo:
+            cmd.append(ruta_archivo)
+        subprocess.Popen(cmd, cwd=str(Path(main_py).parent))
+
     def nuevo_proyecto(self):
+        # Verificar cambios sin guardar antes de crear uno nuevo
+        if self.proyecto and self.proyecto_modificado:
+            resp = QMessageBox.question(
+                self.view, "Proyecto sin guardar",
+                "Hay cambios sin guardar. ¿Desea guardar antes de crear un nuevo proyecto?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+            )
+            if resp == QMessageBox.Cancel:
+                return
+            if resp == QMessageBox.Yes:
+                self.guardar_proyecto()
+
         ruta_mapa, _ = QFileDialog.getOpenFileName(
-            self.view, "Seleccionar mapa", "", "Imagenes (*.png *.jpg *.jpeg)"
+            self.view, "Seleccionar mapa", "",
+            "Mapas (*.stcm *.png *.jpg *.jpeg *.bmp);;STCM (*.stcm);;Imágenes (*.png *.jpg *.jpeg *.bmp)"
         )
         if not ruta_mapa:
             return
-        
+
+        stcm_data = None
+        if ruta_mapa.lower().endswith(".stcm"):
+            try:
+                stcm_data = parse_stcm(ruta_mapa)
+                ruta_mapa = stcm_data.image_path  # Usar el PNG generado
+            except Exception as err:
+                print("✗ Error al parsear archivo STCM:", err)
+                return
+
         # Crear nuevo proyecto
         self.proyecto = Proyecto(ruta_mapa)
-        
+        self.ruta_archivo_actual = None  # Proyecto nuevo, sin archivo aún
+
+        # Guardar metadatos STCM en el proyecto para persistencia
+        if stcm_data:
+            self.proyecto.stcm_origin_x = stcm_data.origin_x
+            self.proyecto.stcm_origin_y = stcm_data.origin_y
+            self.proyecto.stcm_resolution_x = stcm_data.resolution_x
+            self.proyecto.stcm_resolution_y = stcm_data.resolution_y
+            self.ESCALA = stcm_data.resolution_x
+
         # Actualizar referencias en TODOS los subcontroladores
         self._actualizar_referencias_proyecto(self.proyecto)
-        
+
         # Limpiar UI (esto también limpia el historial)
         self._limpiar_ui_completa()
-        
-        # Mostrar mapa
-        self._mostrar_mapa(ruta_mapa)
-        
+
+        # Mostrar mapa (con o sin offset STCM)
+        if stcm_data:
+            self._mostrar_mapa_stcm(ruta_mapa, stcm_data)
+        else:
+            self._mostrar_mapa(ruta_mapa)
+
         # Resetear botones y modo
         self._resetear_modo_actual()
-        
+
         # Inicializar sistema de visibilidad
         self.inicializar_visibilidad()
-        
+
         print("✓ Nuevo proyecto creado con mapa:", ruta_mapa)
         self.diagnosticar_estado_proyecto()
 
     def abrir_proyecto(self):
+        """Abre un proyecto. Si ya hay uno cargado, lo abre en una ventana nueva."""
         ruta_archivo, _ = QFileDialog.getOpenFileName(
             self.view, "Abrir proyecto", "", "JSON Files (*.json)"
         )
         if not ruta_archivo:
             return
+
+        # Si ya hay un proyecto abierto, lanzar en ventana nueva
+        if self.proyecto:
+            self._abrir_en_nueva_ventana(ruta_archivo)
+            return
+
+        # Sin proyecto previo: cargar en esta misma ventana
+        self.abrir_proyecto_desde_ruta(ruta_archivo)
+
+    def abrir_proyecto_desde_ruta(self, ruta_archivo):
+        """Carga un proyecto .json en la ventana actual (sin diálogo de archivo)."""
         try:
-            # Cargar proyecto
-            self.proyecto = Proyecto.cargar(ruta_archivo)
-            
+            # 1) Desconectar señales del proyecto viejo ANTES de tocar nada
+            proyecto_viejo = self.proyecto
+            if proyecto_viejo:
+                self._desconectar_señales_proyecto(proyecto_viejo)
+
+            # 2) Limpiar toda la UI (escena, listas, propiedades, historial)
+            self._limpiar_ui_completa()
+            self.proyecto = None
+
+            # 3) Cargar el nuevo proyecto
+            nuevo_proyecto = Proyecto.cargar(ruta_archivo)
+
             # Asegurarse de que todos los nodos tengan campo "objetivo"
-            for nodo in self.proyecto.nodos:
+            for nodo in nuevo_proyecto.nodos:
                 if isinstance(nodo, dict):
                     if "objetivo" not in nodo:
                         nodo["objetivo"] = 0
                 elif not hasattr(nodo, "objetivo"):
                     setattr(nodo, "objetivo", 0)
-            
-            # Usar el mismo método para actualizar referencias
-            self._actualizar_referencias_proyecto(self.proyecto)
-            
-            # Limpiar UI primero (esto también limpia el historial)
-            self._limpiar_ui_completa()
-            
+
+            # 4) Asignar y conectar señales del nuevo proyecto
+            self._actualizar_referencias_proyecto(nuevo_proyecto)
+
+            # Restaurar escala y offsets desde metadatos STCM si están disponibles
+            if hasattr(self.proyecto, 'stcm_resolution_x') and self.proyecto.stcm_resolution_x:
+                self.ESCALA = self.proyecto.stcm_resolution_x
+
             if self.proyecto.mapa:
-                self._mostrar_mapa(self.proyecto.mapa)
+                # Si el proyecto tiene metadatos STCM, usar offsets exactos
+                if (hasattr(self.proyecto, 'stcm_origin_x') and
+                        self.proyecto.stcm_origin_x is not None and
+                        hasattr(self.proyecto, 'stcm_resolution_x') and
+                        self.proyecto.stcm_resolution_x):
+                    print(f"[CARGAR] Usando offsets STCM guardados: "
+                          f"origin=({self.proyecto.stcm_origin_x}, {self.proyecto.stcm_origin_y}), "
+                          f"resolution=({self.proyecto.stcm_resolution_x}, {self.proyecto.stcm_resolution_y})")
+                    stcm_data = STCMData()
+                    stcm_data.origin_x = self.proyecto.stcm_origin_x
+                    stcm_data.origin_y = self.proyecto.stcm_origin_y
+                    stcm_data.resolution_x = self.proyecto.stcm_resolution_x
+                    stcm_data.resolution_y = self.proyecto.stcm_resolution_y
+                    from PyQt5.QtGui import QPixmap as _QP
+                    _pm = _QP(self.proyecto.mapa)
+                    stcm_data.width = _pm.width()
+                    stcm_data.height = _pm.height()
+                    self._mostrar_mapa_stcm(self.proyecto.mapa, stcm_data)
+                else:
+                    print(f"[CARGAR] SIN metadatos STCM → auto-detección de offset")
+                    self._mostrar_mapa(self.proyecto.mapa)
 
             # Crear NodoItem correctamente
             for nodo in self.proyecto.nodos:
                 try:
                     nodo_item = self._create_nodo_item(nodo)
                 except Exception:
-                    # Crear manualmente pero manteniendo el patrón
                     nodo_item = NodoItem(nodo, editor=self)
                     try:
                         nodo_item.setFlag(nodo_item.ItemIsSelectable, True)
@@ -1907,53 +2070,574 @@ class EditorController(QObject):
                     except Exception:
                         pass
 
-                # Inicializar sistema de visibilidad para cada nodo
                 self._inicializar_nodo_visibilidad(nodo, agregar_a_lista=True)
 
-            # Inicializar sistema de visibilidad
             self.inicializar_visibilidad()
-            
-            # Actualizar listas con widgets
             self._actualizar_lista_nodos_con_widgets()
             self._dibujar_rutas()
             self._mostrar_rutas_lateral()
 
+            self.ruta_archivo_actual = ruta_archivo
+            self.proyecto_modificado = False
             print("✓ Proyecto cargado desde:", ruta_archivo)
             self.diagnosticar_estado_proyecto()
         except Exception as err:
             print("✗ Error al abrir proyecto:", err)
+            import traceback
+            traceback.print_exc()
+
+    def importar_proyecto(self):
+        """Importa nodos, rutas y parámetros de otro proyecto JSON al actual.
+        En conflictos de ID se le pregunta al usuario qué hacer.
+        Las rutas se remapean con los nuevos IDs; se descartan las que usen
+        nodos salteados. Las coordenadas originales se preservan."""
+        if not self.proyecto:
+            QMessageBox.warning(self.view, "Importar proyecto",
+                                "Primero abrí o creá un proyecto destino.")
+            return
+
+        ruta_archivo, _ = QFileDialog.getOpenFileName(
+            self.view, "Importar proyecto (JSON)", "", "JSON Files (*.json)"
+        )
+        if not ruta_archivo:
+            return
+
+        try:
+            proyecto_src = Proyecto.cargar(ruta_archivo)
+        except Exception as e:
+            QMessageBox.critical(self.view, "Importar proyecto",
+                                 f"No se pudo leer el proyecto:\n{e}")
+            return
+
+        # --- 0) Diálogo de selección de elementos a importar ---
+        from View.dialogo_importar_seleccion import DialogoImportarSeleccion
+        dlg_sel = DialogoImportarSeleccion(self.view, proyecto_src)
+        if dlg_sel.exec_() != QDialog.Accepted:
+            return
+
+        rutas_seleccionadas = dlg_sel.rutas_indices
+        importar_todos_nodos = dlg_sel.importar_todos_los_nodos
+        importar_nodos_sueltos = dlg_sel.importar_nodos_sueltos
+        importar_playa = dlg_sel.importar_parametros_playa
+        importar_cd = dlg_sel.importar_parametros_carga_descarga
+
+        if (not rutas_seleccionadas and not importar_todos_nodos
+                and not importar_nodos_sueltos and not importar_playa
+                and not importar_cd):
+            QMessageBox.information(self.view, "Importar proyecto",
+                                    "No seleccionaste nada para importar.")
+            return
+
+        # --- 1) Preparar índice de IDs actuales ---
+        def _nid(n):
+            try:
+                return int(n.get("id") if hasattr(n, "get") else getattr(n, "id", 0))
+            except (TypeError, ValueError):
+                return 0
+        ids_actuales = {_nid(n) for n in self.proyecto.nodos}
+
+        # --- 1.b) Determinar subconjunto de nodos origen a importar ---
+        def _ref_id(ref):
+            if ref is None:
+                return None
+            if isinstance(ref, int):
+                return ref
+            if isinstance(ref, dict):
+                try:
+                    return int(ref.get("id"))
+                except (TypeError, ValueError):
+                    return None
+            if hasattr(ref, "get"):
+                try:
+                    return int(ref.get("id"))
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        ids_nodos_a_importar = set()
+        if importar_todos_nodos:
+            ids_nodos_a_importar = {_nid(n) for n in proyecto_src.nodos}
+        else:
+            # Siempre incluir los nodos referenciados por rutas seleccionadas
+            for idx in rutas_seleccionadas:
+                if idx < 0 or idx >= len(proyecto_src.rutas):
+                    continue
+                ruta = proyecto_src.rutas[idx]
+                if isinstance(ruta, dict):
+                    for key in ("origen", "destino"):
+                        rid = _ref_id(ruta.get(key))
+                        if rid is not None:
+                            ids_nodos_a_importar.add(rid)
+                    for v in (ruta.get("visita") or []):
+                        rid = _ref_id(v)
+                        if rid is not None:
+                            ids_nodos_a_importar.add(rid)
+            if importar_nodos_sueltos:
+                ids_src = {_nid(n) for n in proyecto_src.nodos}
+                ids_nodos_a_importar |= ids_src  # suma los sueltos
+
+        nodos_src_filtrados = [
+            n for n in proyecto_src.nodos if _nid(n) in ids_nodos_a_importar
+        ]
+
+        # --- 2) Pre-calcular conflictos para saber "restantes" ---
+        conflictos_pendientes = sum(
+            1 for n in nodos_src_filtrados if _nid(n) in ids_actuales
+        )
+
+        # --- 3) Resolver IDs: id_source -> id_destino (o None si se saltea) ---
+        from View.dialogo_importar_nodo import DialogoImportarNodo
+
+        def _siguiente_id_libre():
+            base = max(ids_actuales | {0}) + 1
+            while base in ids_actuales:
+                base += 1
+            return base
+
+        id_map = {}
+        accion_global = None   # si el usuario eligió "aplicar a todos"
+        ids_nodos_destino = set(ids_actuales)  # incluye los que vamos sumando
+
+        for nodo_src in nodos_src_filtrados:
+            sid = _nid(nodo_src)
+            if sid not in ids_nodos_destino:
+                # Sin conflicto: mantener ID original
+                id_map[sid] = sid
+                ids_nodos_destino.add(sid)
+                continue
+
+            # Hay conflicto: aplicar acción global o preguntar
+            conflictos_pendientes -= 1
+            accion = accion_global
+            if accion is None:
+                nodo_actual = next(
+                    (n for n in self.proyecto.nodos if _nid(n) == sid), None
+                )
+                nuevo_sugerido = max(ids_nodos_destino | {0}) + 1
+                src_dict = nodo_src.to_dict() if hasattr(nodo_src, "to_dict") else nodo_src
+                act_dict = nodo_actual.to_dict() if hasattr(nodo_actual, "to_dict") else nodo_actual
+                dlg = DialogoImportarNodo(
+                    self.view, src_dict, act_dict or {},
+                    nuevo_sugerido, restantes=conflictos_pendientes
+                )
+                if dlg.exec_() == QDialog.Rejected:
+                    # Cancelar importación
+                    print("✗ Importación cancelada por el usuario.")
+                    return
+                accion = dlg.accion
+                if dlg.aplicar_a_todos:
+                    accion_global = accion
+
+            if accion == "saltear":
+                id_map[sid] = None
+            else:  # nuevo_id
+                nuevo = max(ids_nodos_destino | {0}) + 1
+                id_map[sid] = nuevo
+                ids_nodos_destino.add(nuevo)
+
+        # --- 4) Agregar nodos importados con IDs remapeados ---
+        nodos_importados = 0
+        for nodo_src in nodos_src_filtrados:
+            sid = _nid(nodo_src)
+            nuevo_id = id_map.get(sid)
+            if nuevo_id is None:
+                continue
+            datos = nodo_src.to_dict() if hasattr(nodo_src, "to_dict") else dict(nodo_src)
+            datos = copy.deepcopy(datos)
+            datos["id"] = nuevo_id
+            # Actualizar Punto_encarar si apuntaba a sí mismo
+            pe = datos.get("Punto_encarar", 0)
+            try:
+                pe_int = int(pe) if pe not in (None, "") else 0
+            except (TypeError, ValueError):
+                pe_int = 0
+            if pe_int == sid:
+                datos["Punto_encarar"] = nuevo_id
+            elif pe_int in id_map and id_map[pe_int] is not None:
+                datos["Punto_encarar"] = id_map[pe_int]
+
+            # Crear nodo (objeto Nodo igual que al cargar) y agregarlo
+            try:
+                nodo_obj = Nodo(datos)
+            except Exception:
+                nodo_obj = datos
+            self.proyecto.nodos.append(nodo_obj)
+            try:
+                self.proyecto.nodo_agregado.emit(nodo_obj)
+            except Exception:
+                pass
+            nodos_importados += 1
+
+        # --- 5) Remapear rutas y agregarlas ---
+        rutas_importadas = 0
+        rutas_descartadas = 0
+
+        def _remap_nodo_ref(ref):
+            """Dado un nodo de ruta (int o dict), devuelve el nuevo dict con
+            id remapeado, o None si el nodo fue salteado."""
+            if ref is None:
+                return None
+            if isinstance(ref, int):
+                oid = ref
+                new_id = id_map.get(oid)
+                if new_id is None:
+                    return None
+                return new_id
+            if hasattr(ref, "to_dict"):
+                ref = ref.to_dict()
+            if isinstance(ref, dict):
+                oid = ref.get("id")
+                try:
+                    oid = int(oid)
+                except (TypeError, ValueError):
+                    return None
+                new_id = id_map.get(oid)
+                if new_id is None:
+                    return None
+                nuevo = copy.deepcopy(ref)
+                nuevo["id"] = new_id
+                return nuevo
+            return None
+
+        for idx_r, ruta_src in enumerate(proyecto_src.rutas):
+            if idx_r not in rutas_seleccionadas:
+                continue
+            try:
+                ruta = ruta_src.to_dict() if hasattr(ruta_src, "to_dict") else dict(ruta_src)
+            except Exception:
+                ruta = ruta_src
+            ruta = copy.deepcopy(ruta)
+
+            nueva_ruta = {"nombre": ruta.get("nombre", "Ruta importada")}
+            origen_m = _remap_nodo_ref(ruta.get("origen"))
+            destino_m = _remap_nodo_ref(ruta.get("destino"))
+            if origen_m is None or destino_m is None:
+                rutas_descartadas += 1
+                continue
+
+            visita_orig = ruta.get("visita", []) or []
+            visita_m = []
+            descartar = False
+            for v in visita_orig:
+                vm = _remap_nodo_ref(v)
+                if vm is None:
+                    descartar = True
+                    break
+                visita_m.append(vm)
+            if descartar:
+                rutas_descartadas += 1
+                continue
+
+            nueva_ruta["origen"] = origen_m
+            nueva_ruta["destino"] = destino_m
+            if visita_m:
+                nueva_ruta["visita"] = visita_m
+            try:
+                self.proyecto.agregar_ruta(nueva_ruta)
+                rutas_importadas += 1
+            except Exception as e:
+                print(f"✗ Error al agregar ruta importada: {e}")
+                rutas_descartadas += 1
+
+        # --- 6) Merge parámetros de playa y carga/descarga (renumerar si colisión) ---
+        playas_importadas = 0
+        ids_playa_act = {int(p.get("ID", 0)) for p in self.proyecto.parametros_playa}
+        fuente_playa = (getattr(proyecto_src, "parametros_playa", []) or []) if importar_playa else []
+        for p_src in fuente_playa:
+            p = copy.deepcopy(p_src)
+            pid = int(p.get("ID", 0) or 0)
+            if pid in ids_playa_act:
+                nuevo = (max(ids_playa_act) + 1) if ids_playa_act else 1
+                p["ID"] = nuevo
+                ids_playa_act.add(nuevo)
+            else:
+                ids_playa_act.add(pid)
+            self.proyecto.parametros_playa.append(p)
+            playas_importadas += 1
+        if playas_importadas:
+            try:
+                self.proyecto.parametros_playa_modificados.emit(self.proyecto.parametros_playa)
+            except Exception:
+                pass
+
+        cargas_importadas = 0
+        ids_cd_act = {int(c.get("ID", 0)) for c in self.proyecto.parametros_carga_descarga}
+        fuente_cd = (getattr(proyecto_src, "parametros_carga_descarga", []) or []) if importar_cd else []
+        for c_src in fuente_cd:
+            c = copy.deepcopy(c_src)
+            cid = int(c.get("ID", 0) or 0)
+            if cid in ids_cd_act:
+                nuevo = (max(ids_cd_act) + 1) if ids_cd_act else 1
+                c["ID"] = nuevo
+                ids_cd_act.add(nuevo)
+            else:
+                ids_cd_act.add(cid)
+            self.proyecto.parametros_carga_descarga.append(c)
+            cargas_importadas += 1
+        if cargas_importadas:
+            try:
+                self.proyecto.parametros_carga_descarga_modificados.emit(
+                    self.proyecto.parametros_carga_descarga
+                )
+            except Exception:
+                pass
+
+        # --- 7) Refrescar UI ---
+        try:
+            self._limpiar_ui_completa_preservando_proyecto = True
+        except Exception:
+            pass
+        # Recrear NodoItem de los nodos nuevos
+        try:
+            nodos_existentes_en_escena = {
+                id(it.nodo) if hasattr(it, "nodo") else None
+                for it in self.scene.items() if isinstance(it, NodoItem)
+            }
+        except Exception:
+            nodos_existentes_en_escena = set()
+        for nodo in self.proyecto.nodos:
+            if id(nodo) in nodos_existentes_en_escena:
+                continue
+            try:
+                self._create_nodo_item(nodo)
+            except Exception:
+                pass
+            self._inicializar_nodo_visibilidad(nodo, agregar_a_lista=True)
+
+        self._actualizar_lista_nodos_con_widgets()
+        self._dibujar_rutas()
+        self._mostrar_rutas_lateral()
+        self.proyecto_modificado = True
+        self.proyecto.proyecto_cambiado.emit()
+
+        QMessageBox.information(
+            self.view, "Importar proyecto",
+            f"Importación completada.\n\n"
+            f"• Nodos importados: {nodos_importados}\n"
+            f"• Rutas importadas: {rutas_importadas}\n"
+            f"• Rutas descartadas (por nodos salteados): {rutas_descartadas}\n"
+            f"• Parámetros de playa importados: {playas_importadas}\n"
+            f"• Parámetros carga/descarga importados: {cargas_importadas}"
+        )
+        print(f"✓ Importación: {nodos_importados} nodos, {rutas_importadas} rutas, "
+              f"{rutas_descartadas} rutas descartadas, {playas_importadas} playas, "
+              f"{cargas_importadas} carga/descarga.")
+
+    def _finalizar_rutas_pendientes(self):
+        """Finaliza rutas en construcción antes de guardar."""
+        if hasattr(self, 'ruta_ctrl') and self.ruta_ctrl and hasattr(self.ruta_ctrl, '_nodes_seq'):
+            if len(self.ruta_ctrl._nodes_seq) >= 2:
+                print("✓ Finalizando ruta en construcción antes de guardar...")
+                self.ruta_ctrl._finalize_route()
 
     def guardar_proyecto(self):
+        """Guardar: si ya tiene archivo, guarda ahí. Si no, abre diálogo."""
         if not self.proyecto:
             print("No hay proyecto cargado para guardar")
             return
+
+        self._finalizar_rutas_pendientes()
+
+        # Si ya tiene archivo, guardar directamente
+        if self.ruta_archivo_actual:
+            try:
+                self.proyecto.guardar(self.ruta_archivo_actual)
+                self.proyecto_modificado = False
+                print("✓ Proyecto guardado en:", self.ruta_archivo_actual)
+            except Exception as err:
+                print("✗ Error al guardar proyecto:", err)
+        else:
+            # Si no tiene archivo, usar "Guardar como..."
+            self.guardar_proyecto_como()
+
+    def guardar_proyecto_como(self):
+        """Guardar como: siempre abre diálogo para elegir ubicación."""
+        if not self.proyecto:
+            print("No hay proyecto cargado para guardar")
+            return
+
+        self._finalizar_rutas_pendientes()
+
         ruta_archivo, _ = QFileDialog.getSaveFileName(
-            self.view, "Guardar proyecto", "", "JSON Files (*.json)"
+            self.view, "Guardar proyecto como...", "", "JSON Files (*.json)"
         )
         if not ruta_archivo:
             return
         if not ruta_archivo.lower().endswith(".json"):
             ruta_archivo += ".json"
         try:
-            # El método guardar() de Proyecto ahora guarda rutas simplificadas (solo IDs)
             self.proyecto.guardar(ruta_archivo)
+            self.ruta_archivo_actual = ruta_archivo
+            self.proyecto_modificado = False
             print("✓ Proyecto guardado en:", ruta_archivo)
         except Exception as err:
             print("✗ Error al guardar proyecto:", err)
+
+    def cerrar_proyecto(self):
+        """Cierra el proyecto actual sin cerrar la app."""
+        if not self.proyecto:
+            return
+
+        # Solo preguntar si hay cambios sin guardar
+        if self.proyecto_modificado:
+            from PyQt5.QtWidgets import QMessageBox
+            resp = QMessageBox.question(
+                self.view, "Cerrar proyecto",
+                "Hay cambios sin guardar. ¿Desea guardar antes de cerrar?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+            )
+
+            if resp == QMessageBox.Cancel:
+                return
+            if resp == QMessageBox.Yes:
+                self.guardar_proyecto()
+
+        # Limpiar todo
+        self._limpiar_ui_completa()
+        self.proyecto = None
+        self.ruta_archivo_actual = None
+
+        # Limpiar etiqueta de nodo seleccionado
+        if hasattr(self, 'lbl_nodo_seleccionado'):
+            self.lbl_nodo_seleccionado.setText("")
+            self.lbl_nodo_seleccionado.hide()
+
+        # Resetear modo
+        self.modo_actual = "navegacion"
+        self.actualizar_descripcion_modo("navegacion")
+
+        # Limpiar barra de estado
+        if hasattr(self.view, 'statusBar'):
+            self.view.statusBar().showMessage("Sin proyecto abierto")
+
+        print("✓ Proyecto cerrado")
+
+    def _on_close_window(self):
+        """Callback cuando el usuario cierra la ventana con X. Retorna True para cerrar, False para cancelar."""
+        if not self.proyecto or not self.proyecto_modificado:
+            return True  # No hay cambios, cerrar directamente
+
+        from PyQt5.QtWidgets import QMessageBox
+        resp = QMessageBox.question(
+            self.view, "Cerrar aplicación",
+            "Hay cambios sin guardar. ¿Desea guardar antes de salir?",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+        )
+
+        if resp == QMessageBox.Cancel:
+            return False  # Cancelar cierre
+        if resp == QMessageBox.Yes:
+            self.guardar_proyecto()
+        return True  # Cerrar
+
+    def _detectar_offset_mapa(self, ruta_mapa):
+        """Detecta automáticamente el offset del área blanca (plano real) en el mapa LIDAR.
+        Busca la esquina inferior izquierda del área blanca como origen (0,0)."""
+        from PyQt5.QtGui import QImage
+        image = QImage(ruta_mapa)
+        if image.format() != QImage.Format_ARGB32:
+            image = image.convertToFormat(QImage.Format_ARGB32)
+        w, h = image.width(), image.height()
+        umbral = 240  # Píxeles con valor > umbral se consideran "blanco" (piso)
+        paso = max(1, min(w, h) // 100)  # Muestreo para velocidad
+
+        # Buscar primera columna con blanco significativo (borde izquierdo del plano)
+        offset_x = 0
+        for x in range(w):
+            columna_blanca = 0
+            muestras = 0
+            for y in range(0, h, paso):
+                muestras += 1
+                pixel = image.pixelColor(x, y)
+                if pixel.red() > umbral and pixel.green() > umbral and pixel.blue() > umbral:
+                    columna_blanca += 1
+            if muestras > 0 and columna_blanca / muestras > 0.05:
+                offset_x = x
+                break
+
+        # Buscar última fila con blanco significativo (borde inferior del plano)
+        offset_y = h - 1
+        for y in range(h - 1, -1, -1):
+            fila_blanca = 0
+            muestras = 0
+            for x_s in range(0, w, paso):
+                muestras += 1
+                pixel = image.pixelColor(x_s, y)
+                if pixel.red() > umbral and pixel.green() > umbral and pixel.blue() > umbral:
+                    fila_blanca += 1
+            if muestras > 0 and fila_blanca / muestras > 0.05:
+                offset_y = y
+                break
+
+        self.offset_x_px = offset_x
+        self.offset_y_px = offset_y
+        print(f"[MAPA-AUTO] Offset: X={offset_x}px, Y={offset_y}px | "
+              f"imagen={w}x{h} | ESCALA={self.ESCALA} | "
+              f"NOTA: Y=0 se fija en el borde inferior del área blanca (sin origin STCM)")
 
     def _mostrar_mapa(self, ruta_mapa):
         # Limpia la escena y coloca el mapa al fondo sin interceptar clics
         self.scene.clear()
         pixmap = QPixmap(ruta_mapa)
+        self.alto_mapa_px = pixmap.height()
+        self.ancho_mapa_px = pixmap.width()
+
+        # Detectar offset automáticamente
+        self._detectar_offset_mapa(ruta_mapa)
         pm_item = QGraphicsPixmapItem(pixmap)
         pm_item.setAcceptedMouseButtons(Qt.NoButton)
         pm_item.setFlag(QGraphicsPixmapItem.ItemIsSelectable, False)
         pm_item.setFlag(QGraphicsPixmapItem.ItemIsFocusable, False)
         pm_item.setZValue(0)
         self.scene.addItem(pm_item)
+        self._ajustar_vista_al_mapa(pixmap)
+
+    def _mostrar_mapa_stcm(self, ruta_mapa, stcm_data):
+        """Muestra el mapa usando la imagen completa del archivo como referencia:
+        (0,0) queda en la esquina inferior izquierda del bitmap (blanco + negro),
+        que coincide con el origen físico del mapa según los metadatos STCM."""
+        self.scene.clear()
+        pixmap = QPixmap(ruta_mapa)
+        self.alto_mapa_px = pixmap.height()
+        self.ancho_mapa_px = pixmap.width()
+
+        # (0,0) en la esquina inferior izquierda del bitmap completo.
+        # Equivalente a los offsets STCM cuando origin ≈ 0.
+        self.offset_x_px = 0
+        self.offset_y_px = self.alto_mapa_px
+
+        print(f"[MAPA-STCM] Offset: X={self.offset_x_px}px, Y={self.offset_y_px}px (esquina inferior izquierda del bitmap) | "
+              f"origin STCM=({stcm_data.origin_x}, {stcm_data.origin_y}) | "
+              f"resolution=({stcm_data.resolution_x}, {stcm_data.resolution_y}) | "
+              f"size={stcm_data.width}x{stcm_data.height} | ESCALA={self.ESCALA}")
+
+        pm_item = QGraphicsPixmapItem(pixmap)
+        pm_item.setAcceptedMouseButtons(Qt.NoButton)
+        pm_item.setFlag(QGraphicsPixmapItem.ItemIsSelectable, False)
+        pm_item.setFlag(QGraphicsPixmapItem.ItemIsFocusable, False)
+        pm_item.setZValue(0)
+        self.scene.addItem(pm_item)
+        self._ajustar_vista_al_mapa(pixmap)
+
+    def _ajustar_vista_al_mapa(self, pixmap):
+        """Ajusta el sceneRect al tamaño del bitmap y centra la vista
+        mostrando el mapa completo."""
+        try:
+            from PyQt5.QtCore import QRectF
+            rect = QRectF(0, 0, pixmap.width(), pixmap.height())
+            self.scene.setSceneRect(rect)
+            self.view.marco_trabajo.resetTransform()
+            # Resetear contador interno de zoom si existe
+            try:
+                self.view.marco_trabajo.zoom_level = 0
+            except Exception:
+                pass
+            self.view.marco_trabajo.fitInView(rect, Qt.KeepAspectRatio)
+        except Exception as e:
+            print(f"Error ajustando vista al mapa: {e}")
 
     # --- Helper centralizado para crear NodoItem ---
-    def _create_nodo_item(self, nodo, size=30):
+    def _create_nodo_item(self, nodo, size=15):
         """
         Crea (o recupera) un NodoItem visual para el nodo del modelo,
         lo configura (flags, z-order), conecta la señal moved y lo añade a la escena.
@@ -1973,7 +2657,7 @@ class EditorController(QObject):
         else:
             try:
                 setattr(nodo, "objetivo", 0)  # Valor por defecto
-            except:
+            except Exception:
                 pass
 
         # Crear nuevo NodoItem
@@ -1991,7 +2675,8 @@ class EditorController(QObject):
             nodo_item.setFlag(nodo_item.ItemIsSelectable, True)
             nodo_item.setFlag(nodo_item.ItemIsFocusable, True)
             nodo_item.setFlag(nodo_item.ItemIsMovable, (self.modo_actual == "mover"))
-            nodo_item.setAcceptedMouseButtons(Qt.LeftButton)
+            # Aceptar ambos botones; el RightButton lo consume contextMenuEvent
+            nodo_item.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
             nodo_item.setZValue(1)
         except Exception:
             pass
@@ -2001,13 +2686,6 @@ class EditorController(QObject):
             nodo_item.moved.connect(self.on_nodo_moved)
         except Exception:
             pass
-        
-        # CONEXIÓN DE SEÑALES HOVER
-        try:
-            nodo_item.hover_entered.connect(self.nodo_hover_entered)
-            nodo_item.hover_leaved.connect(self.nodo_hover_leaved)
-        except Exception as e:
-            print(f"Error conectando señales hover: {e}")
 
         # Añadir a la escena y devolver
         try:
@@ -2017,6 +2695,265 @@ class EditorController(QObject):
 
         return nodo_item
 
+    # ============================================================
+    # MODO DUPLICAR NODOS (botón "Duplicar nodo")
+    # ============================================================
+    def _entrar_modo_duplicar(self):
+        """Entra al modo duplicar: los clicks en nodos los marcan/desmarcan
+        para ser duplicados; los clicks en zona vacía los colocan."""
+        self._modo_duplicar_activo = True
+        self._duplicar_items_seleccionados = []
+        self._duplicar_ghost_items = []
+        try:
+            self.actualizar_descripcion_modo("duplicar")
+        except Exception:
+            pass
+        print("✓ Modo Duplicar activado. Click en nodos para marcarlos, "
+              "click en zona vacía para colocar duplicados, Escape para salir.")
+
+    def _salir_modo_duplicar(self):
+        """Sale del modo duplicar: borra fantasmas y quita los marcados."""
+        self._eliminar_ghosts_duplicar()
+        for it in list(self._duplicar_items_seleccionados):
+            try:
+                it.set_marcado_duplicar(False)
+            except Exception:
+                pass
+        self._duplicar_items_seleccionados = []
+        self._modo_duplicar_activo = False
+
+    def _eliminar_ghosts_duplicar(self):
+        """Elimina los items fantasma (círculos y etiquetas) de la escena."""
+        try:
+            for tpl in self._duplicar_ghost_items:
+                ghost = tpl[0]
+                label = tpl[3] if len(tpl) > 3 else None
+                try:
+                    self.scene.removeItem(ghost)
+                except Exception:
+                    pass
+                if label is not None:
+                    try:
+                        self.scene.removeItem(label)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._duplicar_ghost_items = []
+
+    def _crear_ghosts_duplicar(self):
+        """Crea los círculos fantasma + etiquetas de coordenadas para los
+        nodos actualmente marcados."""
+        self._eliminar_ghosts_duplicar()
+        if not self._duplicar_items_seleccionados:
+            return
+        from PyQt5.QtGui import QBrush as _QBrush, QPen as _QPen, QColor as _QColor, QFont
+        from PyQt5.QtWidgets import QGraphicsSimpleTextItem, QGraphicsRectItem
+        from PyQt5.QtCore import QRectF as _QRectF
+
+        # Anchor = primer nodo marcado
+        anchor_item = self._duplicar_items_seleccionados[0]
+        try:
+            ax = int(anchor_item.nodo.get("X", 0))
+            ay = int(anchor_item.nodo.get("Y", 0))
+        except Exception:
+            return
+
+        for it in self._duplicar_items_seleccionados:
+            try:
+                x = int(it.nodo.get("X", 0))
+                y = int(it.nodo.get("Y", 0))
+            except Exception:
+                continue
+            dx, dy = x - ax, y - ay
+            try:
+                ghost = self.scene.addEllipse(
+                    -7.5, -7.5, 15, 15,
+                    _QPen(_QColor(0, 180, 60, 220), 2),
+                    _QBrush(_QColor(0, 180, 60, 120))
+                )
+                ghost.setZValue(2000)
+                ghost.setAcceptedMouseButtons(Qt.NoButton)
+
+                # Etiqueta con coordenadas en vivo (texto + fondo)
+                label = QGraphicsSimpleTextItem("")
+                label.setBrush(_QBrush(_QColor(255, 255, 255)))
+                font = QFont()
+                font.setPointSize(9)
+                font.setBold(True)
+                label.setFont(font)
+                label.setZValue(2001)
+                label.setAcceptedMouseButtons(Qt.NoButton)
+                # Fondo semitransparente
+                bg = QGraphicsRectItem()
+                bg.setBrush(_QBrush(_QColor(0, 0, 0, 180)))
+                bg.setPen(_QPen(_QColor(0, 180, 60, 220), 1))
+                bg.setZValue(2000.5)
+                bg.setAcceptedMouseButtons(Qt.NoButton)
+                self.scene.addItem(bg)
+                self.scene.addItem(label)
+
+                self._duplicar_ghost_items.append((ghost, dx, dy, label, bg))
+            except Exception as e:
+                print(f"Error creando fantasma de duplicación: {e}")
+
+    def _mover_ghosts_duplicar(self, cx, cy):
+        """Mueve los fantasmas para que su ancla quede en (cx, cy) y
+        actualiza las etiquetas con las coordenadas en metros."""
+        if not self._duplicar_ghost_items:
+            return
+        from PyQt5.QtCore import QRectF as _QRectF
+        try:
+            for tpl in self._duplicar_ghost_items:
+                ghost = tpl[0]
+                dx, dy = tpl[1], tpl[2]
+                label = tpl[3] if len(tpl) > 3 else None
+                bg = tpl[4] if len(tpl) > 4 else None
+                gx = cx + dx
+                gy = cy + dy
+                ghost.setPos(gx, gy)
+                ghost.setVisible(True)
+                if label is not None:
+                    x_m = self.x_px_a_metros(gx)
+                    y_m = self.y_px_a_metros(gy)
+                    label.setText(f"({x_m:.2f}, {y_m:.2f})")
+                    # Posicionar texto a la derecha y un poco arriba del fantasma
+                    label.setPos(gx + 10, gy - 22)
+                    label.setVisible(True)
+                    if bg is not None:
+                        br = label.boundingRect()
+                        pad = 3
+                        bg.setRect(_QRectF(
+                            gx + 10 - pad, gy - 22 - pad,
+                            br.width() + 2*pad, br.height() + 2*pad
+                        ))
+                        bg.setVisible(True)
+        except Exception:
+            pass
+
+    def _ocultar_ghosts_duplicar(self):
+        """Oculta los fantasmas y etiquetas (p.ej. cursor sobre nodo)."""
+        try:
+            for tpl in self._duplicar_ghost_items:
+                ghost = tpl[0]
+                label = tpl[3] if len(tpl) > 3 else None
+                bg = tpl[4] if len(tpl) > 4 else None
+                ghost.setVisible(False)
+                if label is not None:
+                    label.setVisible(False)
+                if bg is not None:
+                    bg.setVisible(False)
+        except Exception:
+            pass
+
+    def _duplicar_click_nodo(self, nodo_item, con_ctrl: bool):
+        """Gestiona el click sobre un nodo en modo duplicar.
+
+        - Sin Ctrl: reemplaza la selección actual con solo este nodo
+          y muestra los fantasmas inmediatamente.
+        - Con Ctrl: toggle (agrega/quita de la selección) SIN crear fantasmas;
+          los fantasmas aparecen cuando el usuario suelta Ctrl.
+        """
+        if con_ctrl:
+            if nodo_item in self._duplicar_items_seleccionados:
+                self._duplicar_items_seleccionados.remove(nodo_item)
+                try:
+                    nodo_item.set_marcado_duplicar(False)
+                except Exception:
+                    pass
+            else:
+                self._duplicar_items_seleccionados.append(nodo_item)
+                try:
+                    nodo_item.set_marcado_duplicar(True)
+                except Exception:
+                    pass
+            # Con Ctrl: ocultar fantasmas mientras el usuario sigue seleccionando
+            self._eliminar_ghosts_duplicar()
+        else:
+            # Reemplazar: limpiar marcas previas y marcar sólo este
+            for it in list(self._duplicar_items_seleccionados):
+                try:
+                    it.set_marcado_duplicar(False)
+                except Exception:
+                    pass
+            self._duplicar_items_seleccionados = [nodo_item]
+            try:
+                nodo_item.set_marcado_duplicar(True)
+            except Exception:
+                pass
+            # Sin Ctrl: mostrar fantasmas de inmediato
+            self._crear_ghosts_duplicar()
+        print(f"  Duplicar: {len(self._duplicar_items_seleccionados)} nodo(s) marcado(s)")
+
+    def _duplicar_colocar_en(self, cx, cy):
+        """Crea los duplicados en la posición indicada y limpia la selección
+        para que el usuario pueda continuar duplicando otros nodos."""
+        if not self._duplicar_items_seleccionados or not self.proyecto:
+            return
+        # Datos + offsets relativos al primer nodo marcado
+        anchor_item = self._duplicar_items_seleccionados[0]
+        try:
+            ax = int(anchor_item.nodo.get("X", 0))
+            ay = int(anchor_item.nodo.get("Y", 0))
+        except Exception:
+            return
+
+        datos_a_duplicar = []
+        for it in self._duplicar_items_seleccionados:
+            try:
+                origen = it.nodo.to_dict() if hasattr(it.nodo, "to_dict") else dict(it.nodo)
+            except Exception:
+                origen = {}
+            datos_copia = copy.deepcopy(origen)
+            datos_copia.pop("id", None)
+            x = int(origen.get("X", 0))
+            y = int(origen.get("Y", 0))
+            datos_a_duplicar.append((datos_copia, x - ax, y - ay))
+
+        nuevos_items = []
+        for datos_copia, dx, dy in datos_a_duplicar:
+            nx = int(cx + dx)
+            ny = int(cy + dy)
+            nodo_item = self.crear_nodo(nx, ny, registrar_historial=True)
+            if nodo_item is None:
+                continue
+            props = {k: v for k, v in datos_copia.items()
+                     if k not in ("X", "Y", "id")}
+            try:
+                nodo_item.nodo.update(props)
+            except Exception:
+                for k, v in props.items():
+                    try:
+                        if isinstance(nodo_item.nodo, dict):
+                            nodo_item.nodo[k] = v
+                        else:
+                            setattr(nodo_item.nodo, k, v)
+                    except Exception:
+                        pass
+            try:
+                nodo_item.actualizar_objetivo()
+            except Exception:
+                pass
+            nuevos_items.append(nodo_item)
+
+        try:
+            self._actualizar_lista_nodos_con_widgets()
+        except Exception:
+            pass
+
+        print(f"✓ Duplicados {len(nuevos_items)} nodo(s). "
+              f"Sigue marcando nodos para continuar o desactiva el modo.")
+
+        # Desmarcar los nodos origen y limpiar selección
+        for it in list(self._duplicar_items_seleccionados):
+            try:
+                it.set_marcado_duplicar(False)
+            except Exception:
+                pass
+        self._duplicar_items_seleccionados = []
+        self._eliminar_ghosts_duplicar()
+        self.proyecto_modificado = True
+
     def crear_nodo(self, x=100, y=100, registrar_historial=True):
         """
         Crea un nuevo nodo en las coordenadas especificadas.
@@ -2025,12 +2962,11 @@ class EditorController(QObject):
             print("No hay proyecto cargado")
             return None
 
+        self.proyecto_modificado = True
         try:
-            print(f"DEBUG crear_nodo: Creando nodo en ({x}, {y}) píxeles")
             
             # Primero agregar al modelo
             nodo = self.proyecto.agregar_nodo(x, y)
-            print(f"DEBUG crear_nodo: Nodo creado con ID {nodo.get('id')}")
 
             # Asegurar que el nodo tenga todos los campos necesarios
             if isinstance(nodo, dict):
@@ -2050,7 +2986,7 @@ class EditorController(QObject):
             try:
                 nodo_item = self._create_nodo_item(nodo)
             except Exception as e:
-                print(f"DEBUG crear_nodo: Error al crear NodoItem: {e}")
+                print(f"Error al crear NodoItem: {e}")
                 nodo_item = NodoItem(nodo, editor=self)
                 try:
                     nodo_item.setFlag(nodo_item.ItemIsSelectable, True)
@@ -2061,21 +2997,20 @@ class EditorController(QObject):
                     self.scene.addItem(nodo_item)
                     nodo_item.moved.connect(self.on_nodo_moved)
                 except Exception as e2:
-                    print(f"DEBUG crear_nodo: Error al configurar NodoItem: {e2}")
+                    print(f"Error al configurar NodoItem: {e2}")
                     return None
 
             # --- NUEVA FUNCIÓN PARA INICIALIZAR VISIBILIDAD ---
-            print(f"DEBUG crear_nodo: Llamando a _inicializar_nodo_visibilidad para nodo {nodo.get('id')}")
             self._inicializar_nodo_visibilidad(nodo, agregar_a_lista=True)
             
             # Si hay rutas, actualizar todas las relaciones (para consistencia)
             if hasattr(self.proyecto, 'rutas') and self.proyecto.rutas:
                 self._actualizar_todas_relaciones_nodo_ruta()
 
-            # Mostrar en metros
-            x_m = self.pixeles_a_metros(x)
-            y_m = self.pixeles_a_metros(y)
-            
+            # Mostrar en metros (con offset)
+            x_m = self.x_px_a_metros(x)
+            y_m = self.y_px_a_metros(y)
+
             # Mostrar tipo de nodo
             objetivo = nodo.get('objetivo', 0)
             es_cargador = nodo.get('es_cargador', 0)
@@ -2087,20 +3022,16 @@ class EditorController(QObject):
                 tipo = "DESCARGAR"
             elif objetivo == 3:
                 tipo = "I/O"
+            elif objetivo == 5:
+                tipo = "PASO"
             else:
                 tipo = "Normal"
                 
-            print(f"✓ Nodo ID {nodo.get('id')} ({tipo}) creado con botón de visibilidad en ({x_m:.2f}, {y_m:.2f}) metros")
-            print("Nodo creado:", getattr(nodo, "to_dict", lambda: nodo)())
-            
             # REGISTRAR CREACIÓN EN HISTORIAL (NUEVO)
             if registrar_historial:
-                print(f"DEBUG crear_nodo: Registrando creación en historial para nodo ID {nodo.get('id')}")
                 self._registrar_creacion_nodo(nodo)
-            else:
-                print(f"DEBUG crear_nodo: NO se registra en historial (registrar_historial=False)")
-            
-            return nodo_item  # ← RETORNAR EL NODOITEM
+
+            return nodo_item
                 
         except Exception as e:
             print(f"ERROR en crear_nodo: {e}")
@@ -2119,16 +3050,13 @@ class EditorController(QObject):
             agregar_a_lista: Si True, agrega el nodo a la lista lateral con widget
         """
         try:
-            print(f"DEBUG _inicializar_nodo_visibilidad: nodo_id={nodo.get('id')}, agregar_a_lista={agregar_a_lista}")
             nodo_id = nodo.get('id')
             if nodo_id is None:
-                print("✗ Advertencia: Nodo sin ID en _inicializar_nodo_visibilidad")
                 return
             
             # 1. Inicializar visibilidad del nodo si no existe
             if nodo_id not in self.visibilidad_nodos:
                 self.visibilidad_nodos[nodo_id] = True
-                print(f"  - Visibilidad inicializada para nodo {nodo_id}: True")
             
             # 2. Inicializar relaciones nodo-ruta si no existen
             if nodo_id not in self.nodo_en_rutas:
@@ -2171,18 +3099,20 @@ class EditorController(QObject):
             if agregar_a_lista:
                 x_px = nodo.get('X', 0)
                 y_px = nodo.get('Y', 0)
-                # Convertir a metros
-                x_m = self.pixeles_a_metros(x_px)
-                y_m = self.pixeles_a_metros(y_px)
+                # Convertir a metros (con offset)
+                x_m = self.x_px_a_metros(x_px)
+                y_m = self.y_px_a_metros(y_px)
                 objetivo = nodo.get('objetivo', 0)
                 
                 # Determinar texto según objetivo
                 if objetivo == 1:
-                    texto_objetivo = "IN"
+                    texto_objetivo = "Dejada"
                 elif objetivo == 2:
-                    texto_objetivo = "OUT"
+                    texto_objetivo = "Cogida"
                 elif objetivo == 3:
                     texto_objetivo = "I/O"
+                elif objetivo == 5:
+                    texto_objetivo = "Paso"
                 else:
                     texto_objetivo = "Sin objetivo"
                 
@@ -2199,7 +3129,6 @@ class EditorController(QObject):
                         # Actualizar el widget existente
                         widget.lbl_texto.setText(texto)
                         widget.set_visible(self.visibilidad_nodos.get(nodo_id, True))
-                        print(f"  - Nodo {nodo_id} ya existe en lista, widget actualizado")
                         break
                 
                 # Si no está en la lista, agregarlo
@@ -2217,10 +3146,7 @@ class EditorController(QObject):
                     
                     self.view.nodosList.addItem(item)
                     self.view.nodosList.setItemWidget(item, widget)
-                    
-                    print(f"  ✓ Nodo {nodo_id} agregado a lista lateral con widget de visibilidad")
-            else:
-                print(f"  - Nodo {nodo_id} inicializado (sin agregar a lista)")
+
         except Exception as e:
             print(f"ERROR en _inicializar_nodo_visibilidad: {e}")
 
@@ -2302,7 +3228,7 @@ class EditorController(QObject):
                     nodo_id = origen.get('id') if hasattr(origen, 'get') else getattr(origen, 'id', None)
                     if nodo_id:
                         nodos_ruta.append(origen)
-                except:
+                except Exception:
                     pass
         
         # Visita
@@ -2315,7 +3241,7 @@ class EditorController(QObject):
                     nodo_id = nodo_visita.get('id') if hasattr(nodo_visita, 'get') else getattr(nodo_visita, 'id', None)
                     if nodo_id:
                         nodos_ruta.append(nodo_visita)
-                except:
+                except Exception:
                     pass
         
         # Destino
@@ -2328,7 +3254,7 @@ class EditorController(QObject):
                     nodo_id = destino.get('id') if hasattr(destino, 'get') else getattr(destino, 'id', None)
                     if nodo_id:
                         nodos_ruta.append(destino)
-                except:
+                except Exception:
                     pass
         
         # Resaltar cada nodo en la escena
@@ -2339,7 +3265,7 @@ class EditorController(QObject):
             else:
                 try:
                     nodo_ruta_id = nodo_ruta.get('id') if hasattr(nodo_ruta, 'get') else getattr(nodo_ruta, 'id', None)
-                except:
+                except Exception:
                     nodo_ruta_id = None
             
             if nodo_ruta_id is None:
@@ -2355,7 +3281,7 @@ class EditorController(QObject):
                     else:
                         try:
                             item_id = item_nodo.get('id') if hasattr(item_nodo, 'get') else getattr(item_nodo, 'id', None)
-                        except:
+                        except Exception:
                             item_id = None
                     
                     # Si los IDs coinciden, resaltar el nodo
@@ -2415,7 +3341,11 @@ class EditorController(QObject):
     def seleccionar_nodo_desde_mapa(self):
         if self._changing_selection:
             return
-        seleccionados = self.scene.selectedItems()
+        # Protección contra scene eliminada durante teardown de la app
+        try:
+            seleccionados = self.scene.selectedItems()
+        except RuntimeError:
+            return
         if not seleccionados:
             return
         nodo_item = seleccionados[0]
@@ -2475,28 +3405,146 @@ class EditorController(QObject):
             self._changing_selection = False
 
     def mostrar_menu_nodos_superpuestos(self, nodos, pos):
-        """Muestra un menú para seleccionar entre nodos superpuestos"""
-        menu = QMenu(self.view)
-        menu.setTitle("Nodos superpuestos - Selecciona uno:")
-        
+        """Muestra un diálogo con checkboxes para seleccionar nodos superpuestos"""
+        dialog = QDialog(self.view)
+        dialog.setWindowTitle("Nodos superpuestos")
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #161b22;
+                color: #e6edf3;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+            }
+            QLabel {
+                color: #58a6ff;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 4px 0px;
+            }
+            QCheckBox {
+                color: #e6edf3;
+                font-size: 11px;
+                spacing: 8px;
+                padding: 4px 8px;
+                border-radius: 4px;
+            }
+            QCheckBox:hover {
+                background-color: #21262d;
+            }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid #30363d;
+                border-radius: 3px;
+                background-color: #0d1117;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #1f6feb;
+                border-color: #58a6ff;
+            }
+            QPushButton {
+                background-color: #21262d;
+                color: #e6edf3;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-weight: bold;
+                font-size: 11px;
+                min-width: 70px;
+            }
+            QPushButton:hover {
+                background-color: #30363d;
+                border-color: #8b949e;
+            }
+            QPushButton#btnAceptar {
+                background-color: #1f6feb;
+                border-color: #58a6ff;
+                color: #ffffff;
+            }
+            QPushButton#btnAceptar:hover {
+                background-color: #388bfd;
+            }
+        """)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+
+        titulo = QLabel(f"Selecciona los nodos ({len(nodos)} detectados)")
+        layout.addWidget(titulo)
+
+        dialog._resultado = []
+
+        nodo_buttons = []
         for nodo_item in nodos:
             nodo = nodo_item.nodo
             objetivo = nodo.get('objetivo', 0)
-            texto_objetivo = "IN" if objetivo == 1 else "OUT" if objetivo == 2 else "I/O" if objetivo == 3 else "Sin objetivo"
-            
-            # Obtener coordenadas en metros
-            x_px = nodo.get('X', 0)
-            y_px = nodo.get('Y', 0)
-            x_m = self.pixeles_a_metros(x_px)
-            y_m = self.pixeles_a_metros(y_px)
-            
-            action = menu.addAction(f"ID: {nodo.get('id')} - {texto_objetivo} ({x_m:.2f}, {y_m:.2f})")
-            action.triggered.connect(lambda checked, n=nodo: self.seleccionar_nodo_especifico(n))
-        
-        # Mostrar el menú en la posición del cursor
-        menu.exec_(self.view.marco_trabajo.mapToGlobal(
-            self.view.marco_trabajo.mapFromScene(pos)
-        ))
+            texto_objetivo = "Dejada" if objetivo == 1 else "Cogida" if objetivo == 2 else "I/O" if objetivo == 3 else "Cargador" if objetivo == 4 else "Paso" if objetivo == 5 else "Normal"
+
+            x_m = self.x_px_a_metros(nodo.get('X', 0))
+            y_m = self.y_px_a_metros(nodo.get('Y', 0))
+
+            btn = QPushButton(f"  Nodo {nodo.get('id')} - {texto_objetivo} ({x_m:.2f}, {y_m:.2f})")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet("""
+                QPushButton {
+                    text-align: left;
+                    padding: 8px 12px;
+                    font-size: 11px;
+                }
+            """)
+
+            def hacer_seleccion_unica(checked, item=nodo_item):
+                dialog._resultado = [item]
+                dialog.accept()
+
+            btn.clicked.connect(hacer_seleccion_unica)
+            layout.addWidget(btn)
+            nodo_buttons.append((btn, nodo_item))
+
+        # Separador y botón Todos
+        layout.addSpacing(4)
+        btn_todos = QPushButton("Todos")
+        btn_todos.setObjectName("btnAceptar")
+        btn_todos.setCursor(Qt.PointingHandCursor)
+
+        def seleccionar_todos():
+            dialog._resultado = [item for _, item in nodo_buttons]
+            dialog.accept()
+
+        btn_todos.clicked.connect(seleccionar_todos)
+        layout.addWidget(btn_todos)
+
+        if dialog.exec_() == QDialog.Accepted:
+            seleccionados = dialog._resultado
+            if len(seleccionados) == 1:
+                self.seleccionar_nodo_especifico(seleccionados[0].nodo)
+            elif len(seleccionados) > 1:
+                self.seleccionar_nodos_multiples(seleccionados)
+
+    def seleccionar_nodos_multiples(self, nodo_items):
+        """Selecciona múltiples nodos para moverlos juntos"""
+        self._changing_selection = True
+        try:
+            # Limpiar selecciones previas
+            for item in self.scene.selectedItems():
+                item.setSelected(False)
+            self.restaurar_colores_nodos()
+
+            # Seleccionar todos los nodos del grupo
+            ids = []
+            for nodo_item in nodo_items:
+                nodo_item.setSelected(True)
+                nodo_item.set_selected_color()
+                nodo_id = nodo_item.nodo.get("id", "?") if hasattr(nodo_item, 'nodo') else "?"
+                ids.append(str(nodo_id))
+
+            # Mostrar los IDs en la etiqueta de propiedades
+            if hasattr(self, 'lbl_nodo_seleccionado'):
+                self.lbl_nodo_seleccionado.setText(f"Nodos #{', #'.join(ids)}")
+                self.lbl_nodo_seleccionado.show()
+        finally:
+            self._changing_selection = False
+            self._actualizar_cursor()
 
     def seleccionar_nodo_especifico(self, nodo):
         """Selecciona un nodo específico desde el menú de superposición"""
@@ -2505,7 +3553,7 @@ class EditorController(QObject):
             # Limpiar selecciones previas
             for item in self.scene.selectedItems():
                 item.setSelected(False)
-            
+
             # Primero restaurar todos los nodos a color normal
             self.restaurar_colores_nodos()
             
@@ -2530,6 +3578,33 @@ class EditorController(QObject):
             self._changing_selection = False
             self._actualizar_cursor()
 
+    def _actualizar_label_lateral_nodo(self, nodo):
+        """Actualiza solo el texto del widget lateral de un nodo, SIN tocar la tabla
+        de propiedades. Se usa cuando el usuario está editando una celda y no
+        queremos destruir la celda en curso."""
+        nodo_id = nodo.get('id')
+        for i in range(self.view.nodosList.count()):
+            item = self.view.nodosList.item(i)
+            widget = self.view.nodosList.itemWidget(item)
+            if widget and hasattr(widget, 'nodo_id') and widget.nodo_id == nodo_id:
+                x_px = nodo.get('X', 0)
+                y_px = nodo.get('Y', 0)
+                x_m = self.x_px_a_metros(x_px)
+                y_m = self.y_px_a_metros(y_px)
+                objetivo = nodo.get('objetivo', 0)
+                if objetivo == 1:
+                    texto_objetivo = "Dejada"
+                elif objetivo == 2:
+                    texto_objetivo = "Cogida"
+                elif objetivo == 3:
+                    texto_objetivo = "I/O"
+                elif objetivo == 5:
+                    texto_objetivo = "Paso"
+                else:
+                    texto_objetivo = "Sin objetivo"
+                widget.lbl_texto.setText(f"ID {nodo_id} - {texto_objetivo} ({x_m:.2f}, {y_m:.2f})")
+                break
+
     def actualizar_lista_nodo(self, nodo):
         """Actualizar la lista lateral del panel de propiedades con las coordenadas nuevas (en metros)"""
         nodo_id = nodo.get('id')
@@ -2539,18 +3614,20 @@ class EditorController(QObject):
             if widget and hasattr(widget, 'nodo_id') and widget.nodo_id == nodo_id:
                 x_px = nodo.get('X', 0)
                 y_px = nodo.get('Y', 0)
-                # Convertir a metros
-                x_m = self.pixeles_a_metros(x_px)
-                y_m = self.pixeles_a_metros(y_px)
+                # Convertir a metros (con offset)
+                x_m = self.x_px_a_metros(x_px)
+                y_m = self.y_px_a_metros(y_px)
                 objetivo = nodo.get('objetivo', 0)
                 
                 # Determinar texto según objetivo
                 if objetivo == 1:
-                    texto_objetivo = "IN"
+                    texto_objetivo = "Dejada"
                 elif objetivo == 2:
-                    texto_objetivo = "OUT"
+                    texto_objetivo = "Cogida"
                 elif objetivo == 3:
                     texto_objetivo = "I/O"
+                elif objetivo == 5:
+                    texto_objetivo = "Paso"
                 else:
                     texto_objetivo = "Sin objetivo"
                 
@@ -2596,10 +3673,7 @@ class EditorController(QObject):
                 self.view.propertiesTable.itemChanged.disconnect(self._actualizar_propiedad_ruta)
             except Exception:
                 pass
-            self.view.propertiesTable.clear()
-            self.view.propertiesTable.setRowCount(0)
-            self.view.propertiesTable.setColumnCount(2)
-            self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
+            self._limpiar_propiedades()
             try:
                 self.view.propertiesTable.itemChanged.connect(self._actualizar_propiedad_ruta)
             except Exception:
@@ -2718,9 +3792,7 @@ class EditorController(QObject):
             pass
         
         self.view.propertiesTable.blockSignals(True)
-        self.view.propertiesTable.clear()
-        self.view.propertiesTable.setColumnCount(2)
-        self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
+        self._limpiar_propiedades()
 
         # Obtener IDs de la ruta completa
         ruta_completa_ids = self._obtener_ids_ruta_completa(ruta_dict)
@@ -2857,7 +3929,6 @@ class EditorController(QObject):
         try:
             # Verificar que tenemos una ruta seleccionada
             if self.ruta_actual_idx is None:
-                print("No hay ruta seleccionada")
                 return
 
             # Obtener la ruta actual del proyecto
@@ -2892,7 +3963,6 @@ class EditorController(QObject):
                 ruta_completa_ids = self._obtener_ids_ruta_completa(ruta_dict)
                 valor_anterior = f"[{', '.join(str(id) for id in ruta_completa_ids)}]"
             
-            print(f"Actualizando ruta - Campo: {campo}, Valor: {texto}")
             
             # Procesar según el campo
             valor_nuevo = None
@@ -2992,7 +4062,6 @@ class EditorController(QObject):
             if self.ruta_actual_idx == self.ruta_actual_idx:
                 self.mostrar_propiedades_ruta(ruta_dict)
             
-            print(f"Ruta actualizada exitosamente")
             
         except Exception as err:
             print("Error en _actualizar_propiedad_ruta:", err)
@@ -3022,29 +4091,27 @@ class EditorController(QObject):
             
             for i in range(len(ruta_reconstruida) - 1):
                 n1, n2 = ruta_reconstruida[i], ruta_reconstruida[i + 1]
-                
-                # --- OBTENER ES_CURVA DEL NODO ACTUAL (desde el proyecto) ---
-                es_curva_valor = 0
-                # Extraer ID del nodo destino
+
+                # --- OBTENER Tipo_curva DEL NODO DESTINO ---
+                tipo_curva_valor = 0
                 nodo_id = None
                 if isinstance(n2, dict):
                     nodo_id = n2.get('id')
                 elif hasattr(n2, 'get'):
                     nodo_id = n2.get('id')
-                
+
                 if nodo_id is not None:
                     nodo_actual = self._obtener_nodo_actual(nodo_id)
                     if nodo_actual:
-                        # Obtener el valor actual de es_curva (convertir a entero)
                         raw = nodo_actual.get('Tipo_curva', 0)
                         try:
-                            es_curva_valor = int(raw)
+                            tipo_curva_valor = int(raw)
                         except (ValueError, TypeError):
-                            es_curva_valor = 0
-                # -------------------------------------------------------------
-                
+                            tipo_curva_valor = 0
+                # -------------------------------------------
+
                 segment_pen = QPen(base_pen)
-                if es_curva_valor != 0:
+                if tipo_curva_valor != 0:
                     segment_pen.setStyle(Qt.DashLine)
                 else:
                     segment_pen.setStyle(Qt.SolidLine)
@@ -3087,43 +4154,182 @@ class EditorController(QObject):
             self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
 
             propiedades = nodo.to_dict() if hasattr(nodo, "to_dict") else nodo
+
+            # Mostrar ID del nodo en la etiqueta superior
+            nodo_id = propiedades.get("id", "?") if isinstance(propiedades, dict) else "?"
+            self.lbl_nodo_seleccionado.setText(f"Nodo #{nodo_id}")
+            self.lbl_nodo_seleccionado.show()
             
-            # Obtener claves de NODO_FIELDS que no son 'id' ni pertenecen a OBJETIVO_FIELDS
-            # (los campos de objetivo se muestran en el diálogo avanzado)
-            claves_basicas = [k for k in NODO_FIELDS.keys() if k != 'id' and k not in OBJETIVO_FIELDS]
-            propiedades_basicas = claves_basicas
-                        
-            # Filtrar también las propiedades de objetivo para no mostrarlas aquí
+            # Propiedades básicas desde el esquema: todas las de NODO_FIELDS salvo 'id'
+            # y las que pertenecen a OBJETIVO_FIELDS (que se editan en el diálogo avanzado).
+            # Se excluye 'es_cargador' porque se maneja dentro del combo de objetivo.
+            propiedades_basicas = [
+                k for k in NODO_FIELDS.keys()
+                if k != 'id' and k not in OBJETIVO_FIELDS and k != 'es_cargador'
+            ]
             claves_filtradas = [k for k in propiedades_basicas if k in propiedades]
 
-            # Si el nodo tiene objetivo != 0, añadimos espacio para el botón
+            # Si el nodo tiene objetivo != 0 (y no es "Paso"=5), añadimos espacio para el botón
             objetivo = propiedades.get("objetivo", 0)
-            if objetivo != 0:
+            if objetivo != 0 and objetivo != 5:
                 total_filas = len(claves_filtradas) + 2  # +1 para separador, +1 para botón
             else:
                 total_filas = len(claves_filtradas)
             
             self.view.propertiesTable.setRowCount(total_filas)
 
+            # Opciones del desplegable de objetivo con colores
+            OBJETIVO_OPCIONES = [
+                (0, "Normal", "#0078D7"),
+                (1, "Dejada", "#DC2828"),
+                (2, "Cogida", "#00B43C"),
+                (3, "I/O", "#9600C8"),
+                (4, "Cargador", "#E68200"),
+                (5, "Paso", "#BBBBBB"),
+            ]
+
             # Mostrar propiedades básicas
             for row, clave in enumerate(claves_filtradas):
                 valor = propiedades.get(clave)
-                
-                # Convertir X e Y a metros para mostrar
-                if clave in ["X", "Y"] and isinstance(valor, (int, float)):
-                    valor = self.pixeles_a_metros(valor)
 
-                key_item = QTableWidgetItem(clave)
+                # Convertir X e Y a metros para mostrar (con offset)
+                if clave == "X" and isinstance(valor, (int, float)):
+                    valor = self.x_px_a_metros(valor)
+                elif clave == "Y" and isinstance(valor, (int, float)):
+                    valor = self.y_px_a_metros(valor)
+
+                # Nombres de display con unidades / etiquetas legibles
+                nombres_display = {
+                    "timeout": "timeout (s)",
+                    "seg_2d_tras": "seguridad 2d trasera",
+                }
+                nombre_mostrar = nombres_display.get(clave, clave)
+
+                key_item = QTableWidgetItem(nombre_mostrar)
                 key_item.setFlags(Qt.ItemIsEnabled)
                 self.view.propertiesTable.setItem(row, 0, key_item)
 
-                val_item = QTableWidgetItem(str(valor))
+                # Para "objetivo" y "es_cargador", usar combo desplegable
+                if clave == "objetivo":
+                    # Subclase que ignora flechas con popup cerrado para que la
+                    # navegación con teclado en la tabla no abra el diálogo
+                    # de objetivo sin querer.
+                    combo = _ComboObjetivoSinFlechas()
+                    combo.setFocusPolicy(Qt.ClickFocus)
+                    # Colores para referencia rápida
+                    colores_combo = [c for _, _, c in OBJETIVO_OPCIONES]
+
+                    def _aplicar_color_combo(cb, idx, colores=colores_combo):
+                        """Aplica el color correspondiente al texto del combo"""
+                        color_hex = colores[idx] if idx < len(colores) else "#FFFFFF"
+                        cb.setStyleSheet(f"""
+                            QComboBox {{
+                                background-color: #3c3c3c;
+                                color: {color_hex};
+                                border: 1px solid #555;
+                                padding: 2px 5px;
+                                font-size: 13px;
+                                font-weight: bold;
+                            }}
+                            QComboBox::drop-down {{
+                                border: none;
+                            }}
+                            QComboBox QAbstractItemView {{
+                                background-color: #2d2d2d;
+                                color: white;
+                                selection-background-color: #555;
+                            }}
+                        """)
+
+                    current_val = int(valor) if valor is not None else 0
+                    current_index = 0
+                    for i, (val, nombre, color) in enumerate(OBJETIVO_OPCIONES):
+                        combo.addItem(f"  ● {nombre}", val)
+                        from PyQt5.QtGui import QColor as QC
+                        combo.model().item(i).setForeground(QC(color))
+                        if val == current_val:
+                            current_index = i
+
+                    combo.setCurrentIndex(current_index)
+                    _aplicar_color_combo(combo, current_index)
+
+                    def on_objetivo_activated(index, n=nodo, cb=combo):
+                        """Solo se dispara cuando el USUARIO selecciona del combo"""
+                        try:
+                            _aplicar_color_combo(cb, index)
+                            new_val = cb.itemData(index)
+                            old_val = n.get("objetivo", 0)
+                            if new_val == old_val:
+                                return
+                            if new_val == 4:
+                                # Mantener es_cargador actual si ya tenía un valor, si no forzar a 0
+                                # (el diálogo de propiedades pedirá el ID obligatoriamente)
+                                actual_cargador = int(n.get("es_cargador", 0) or 0)
+                                self.proyecto.actualizar_nodo({"id": n.get("id"), "objetivo": 4, "es_cargador": actual_cargador})
+                            else:
+                                self.proyecto.actualizar_nodo({"id": n.get("id"), "objetivo": new_val, "es_cargador": 0})
+                            # "Paso" (5) se comporta como Normal (0): no abre diálogo de objetivo
+                            # ni agrega propiedades avanzadas; sólo cambia el color y el valor en CSV.
+                            if new_val == 5:
+                                self._on_nodo_modificado(n)
+                                return
+                            if new_val != 0:
+                                punto_encarar = n.get("Punto_encarar", 0)
+                                if punto_encarar == 0 or punto_encarar == "0":
+                                    if isinstance(n, dict):
+                                        n["Punto_encarar"] = n.get("id", 0)
+                                    else:
+                                        n.update({"Punto_encarar": n.get("id", 0)})
+                                # Nombre por defecto según tipo de objetivo
+                                nombres_default = {1: "Dejada", 2: "Cogida", 3: "I/O", 4: "Cargador"}
+                                nombre_actual = n.get("Nombre", "")
+                                if not nombre_actual or nombre_actual in ("", "Dejada", "Cogida", "I/O", "Cargador"):
+                                    nombre_def = nombres_default.get(new_val, "")
+                                    if isinstance(n, dict):
+                                        n["Nombre"] = nombre_def
+                                    else:
+                                        n.update({"Nombre": nombre_def})
+                                # Abrir popup ANTES de refrescar la tabla
+                                # Abrir popup: si cancela, revertir objetivo
+                                resultado = self._mostrar_dialogo_propiedades_objetivo(n)
+                                if resultado == "cancelado":
+                                    # Revertir objetivo al valor anterior
+                                    if old_val == 4:
+                                        self.proyecto.actualizar_nodo({"id": n.get("id"), "objetivo": old_val, "es_cargador": 1})
+                                    else:
+                                        self.proyecto.actualizar_nodo({"id": n.get("id"), "objetivo": old_val, "es_cargador": 0})
+                                    if isinstance(n, dict):
+                                        n["Nombre"] = ""
+                                    else:
+                                        n.update({"Nombre": ""})
+                                    self._on_nodo_modificado(n)
+                                    return
+                            self._on_nodo_modificado(n)
+                        except Exception as e:
+                            print(f"ERROR en on_objetivo_activated: {e}")
+                            import traceback
+                            traceback.print_exc()
+
+                    combo.activated.connect(on_objetivo_activated)
+                    self.view.propertiesTable.setCellWidget(row, 1, combo)
+                    continue
+
+                # Para X/Y, mostrar con 4 decimales para evitar ruido por
+                # imprecisión de float (p.ej. "47.36999999999999" en vez de "47.37")
+                if clave in ("X", "Y"):
+                    try:
+                        texto_celda = f"{float(valor):.4f}"
+                    except (ValueError, TypeError):
+                        texto_celda = str(valor)
+                else:
+                    texto_celda = str(valor)
+                val_item = QTableWidgetItem(texto_celda)
                 val_item.setFlags(val_item.flags() | Qt.ItemIsEditable)
                 val_item.setData(Qt.UserRole, (nodo, clave))
                 self.view.propertiesTable.setItem(row, 1, val_item)
             
-            # Si el nodo tiene objetivo != 0, añadir un botón para editar propiedades avanzadas
-            if objetivo != 0:
+            # Si el nodo tiene objetivo != 0 (y no es "Paso"=5), añadir un botón para editar propiedades avanzadas
+            if objetivo != 0 and objetivo != 5:
                 fila_separador = len(claves_filtradas)
                 fila_boton = fila_separador + 1
                 
@@ -3175,7 +4381,12 @@ class EditorController(QObject):
             propiedades_actuales = nodo
         else:
             propiedades_actuales = {}
-        
+
+        # Pre-cargar Punto_encarar con el ID del nodo si no tiene valor
+        punto_encarar = propiedades_actuales.get("Punto_encarar", 0)
+        if punto_encarar == 0 or punto_encarar == "0":
+            propiedades_actuales["Punto_encarar"] = propiedades_actuales.get("id", 0)
+
         # Crear y mostrar el diálogo
         from View.dialogo_propiedades_objetivo import DialogoPropiedadesObjetivo
         dialogo = DialogoPropiedadesObjetivo(self.view, propiedades_actuales)
@@ -3183,7 +4394,7 @@ class EditorController(QObject):
         if dialogo.exec_() == QDialog.Accepted:
             # Obtener las propiedades del diálogo
             nuevas_propiedades = dialogo.obtener_propiedades()
-            
+
             # Registrar cada cambio individual en el historial
             for clave, valor in nuevas_propiedades.items():
                 valor_anterior = propiedades_actuales.get(clave)
@@ -3194,18 +4405,23 @@ class EditorController(QObject):
                         valor_anterior,
                         valor
                     )
-            
+
             # Actualizar todas las propiedades a la vez
             datos_actualizacion = {"id": nodo.get('id')}
             datos_actualizacion.update(nuevas_propiedades)
             self.proyecto.actualizar_nodo(datos_actualizacion)
+            return True
+        # Distinguir Cancelar (revertir) de cerrar con X (ya se validó y aceptó arriba)
+        if getattr(dialogo, '_cancelado', False):
+            return "cancelado"
+        return True
             
-            print(f"✓ Propiedades de objetivo actualizadas para nodo {nodo.get('id')}")
 
     def _actualizar_propiedad_nodo(self, item):
         """Actualiza la propiedad de un nodo a través del proyecto para notificar cambios"""
         if self._updating_ui or item.column() != 1:
             return
+        self.proyecto_modificado = True
 
         try:
             nodo, clave = item.data(Qt.UserRole)
@@ -3253,9 +4469,8 @@ class EditorController(QObject):
                     
                     # Si el objetivo cambia de diferente de 0 a 0
                     elif nuevo_objetivo == 0 and valor_anterior_int != 0:
-                        # No hacer nada especial, las propiedades avanzadas se mantienen pero no se muestran
-                        print(f"Objetivo cambiado a 0, propiedades avanzadas permanecen guardadas")
-                        
+                        pass  # Las propiedades avanzadas se mantienen pero no se muestran
+
                 return  # Salir ya que hemos manejado el cambio de objetivo
                     
             except ValueError:
@@ -3265,56 +4480,89 @@ class EditorController(QObject):
                     item.setText(str(valor_anterior))
                 return
         
-        # Para todas las demás propiedades, comportamiento normal
+        # Si la clave es X o Y, parsear como float aceptando coma o punto decimal
+        if clave in ["X", "Y"]:
+            try:
+                texto_normalizado = texto.replace(',', '.').strip()
+                valor_metros = float(texto_normalizado)
+            except (ValueError, TypeError):
+                print(f"Error: Valor de {clave} debe ser un número (recibido: {repr(texto)})")
+                # Restaurar el valor anterior en la celda
+                if valor_anterior is not None:
+                    if clave == "Y":
+                        anterior_m = self.y_px_a_metros(valor_anterior)
+                    else:
+                        anterior_m = self.x_px_a_metros(valor_anterior)
+                    self._updating_ui = True
+                    try:
+                        item.setText(f"{anterior_m:.4f}")
+                    finally:
+                        self._updating_ui = False
+                return
+
+            # Convertir metros a píxeles (con offset)
+            if clave == "Y":
+                valor_pixeles = self.y_metros_a_px(valor_metros)
+            else:
+                valor_pixeles = self.x_metros_a_px(valor_metros)
+
+            # Registrar en historial (en metros para el usuario)
+            if valor_anterior is not None:
+                if clave == "Y":
+                    valor_anterior_metros = self.y_px_a_metros(valor_anterior)
+                else:
+                    valor_anterior_metros = self.x_px_a_metros(valor_anterior)
+                self.registrar_cambio_propiedad_nodo(
+                    nodo.get('id'),
+                    clave,
+                    valor_anterior_metros,
+                    valor_metros
+                )
+
+            # Marcar que la modificación viene desde la tabla:
+            # _on_nodo_modificado evitará refrescar la tabla y romper la edición.
+            self._updating_from_table = True
+            try:
+                self.proyecto.actualizar_nodo({
+                    "id": nodo.get('id'),
+                    clave: valor_pixeles
+                })
+            finally:
+                self._updating_from_table = False
+
+            # Forzar actualización visual del NodoItem en la escena
+            nodo_id = nodo.get('id')
+            for scene_item in self.scene.items():
+                if isinstance(scene_item, NodoItem) and scene_item.nodo.get('id') == nodo_id:
+                    scene_item.actualizar_posicion()
+                    scene_item.update()
+                    break
+            return
+
+        # Para todas las demás propiedades, intentar parsear como literal de Python
         try:
-            # Intentar evaluar el valor (para números, listas, etc.)
             valor = ast.literal_eval(texto)
         except Exception:
-            # Si falla, usar el texto como string
             valor = texto
 
         try:
-            # Si la clave es X o Y, convertir de metros a píxeles
-            if clave in ["X", "Y"]:
-                try:
-                    valor_metros = float(valor)
-                    valor_pixeles = self.metros_a_pixeles(valor_metros)
-                    
-                    # Registrar en historial (en metros para el usuario)
-                    if valor_anterior is not None:
-                        valor_anterior_metros = self.pixeles_a_metros(valor_anterior)
-                        self.registrar_cambio_propiedad_nodo(
-                            nodo.get('id'), 
-                            clave, 
-                            valor_anterior_metros, 
-                            valor_metros
-                        )
-                    
-                    # Actualizar usando el proyecto (emitirá señal)
-                    self.proyecto.actualizar_nodo({
-                        "id": nodo.get('id'),
-                        clave: valor_pixeles
-                    })
-                    
-                except ValueError:
-                    print(f"Error: Valor de {clave} debe ser un número")
-                    return
-            else:
-                # Para otras propiedades
-                if valor_anterior is not None and valor_anterior != valor:
-                    self.registrar_cambio_propiedad_nodo(
-                        nodo.get('id'), 
-                        clave, 
-                        valor_anterior, 
-                        valor
-                    )
-                
-                # Actualizar usando el proyecto (emitirá señal)
+            if valor_anterior is not None and valor_anterior != valor:
+                self.registrar_cambio_propiedad_nodo(
+                    nodo.get('id'),
+                    clave,
+                    valor_anterior,
+                    valor
+                )
+
+            self._updating_from_table = True
+            try:
                 self.proyecto.actualizar_nodo({
                     "id": nodo.get('id'),
                     clave: valor
                 })
-                    
+            finally:
+                self._updating_from_table = False
+
         except Exception as err:
             print("Error actualizando nodo en el modelo:", err)
             
@@ -3325,10 +4573,11 @@ class EditorController(QObject):
         Elimina un nodo del proyecto y de la escena. Además:
         - Reconfigura las rutas que contengan este nodo según su posición:
         * Si es el origen: toma el primer elemento de visita como nuevo origen
-        * Si es el destino: toma el último elemento de visita como nuevo destino  
+        * Si es el destino: toma el último elemento de visita como nuevo destino
         * Si es intermedio: elimina el nodo de la visita y reconecta
         - Actualiza la lista lateral de nodos y rutas y limpia el panel de propiedades si procede.
         """
+        self.proyecto_modificado = True
         try:
             # GUARDAR INFORMACIÓN PARA UNDO
             # Guardar una copia profunda del nodo y rutas afectadas
@@ -3372,14 +4621,36 @@ class EditorController(QObject):
                         print(f"Error al procesar ruta para undo: {e}")
                         continue
             
-            # 1) Quitar de la escena el NodoItem visual si sigue vivo
+            nodo_id = nodo.get("id")
+
+            # 1) Quitar de la escena el NodoItem visual.
+            #    Si nos pasaron el item, lo intentamos directo. Además
+            #    barremos la escena buscando por id por si quedó algún
+            #    NodoItem duplicado/huérfano (esto evitaba que el vértice
+            #    "no se eliminara" cuando el item recibido estaba stale).
             try:
-                if getattr(nodo_item, "scene", None) and nodo_item.scene() is not None:
+                if nodo_item is not None and getattr(nodo_item, "scene", None) and nodo_item.scene() is not None:
                     self.scene.removeItem(nodo_item)
             except Exception:
                 pass
 
-            nodo_id = nodo.get("id")
+            try:
+                for sit in list(self.scene.items()):
+                    if isinstance(sit, NodoItem) and sit.nodo.get('id') == nodo_id:
+                        try:
+                            self.scene.removeItem(sit)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Forzar repintado completo de la escena para eliminar
+            # residuos visuales del nodo (artefactos por rotación/margen extra)
+            try:
+                self.scene.update()
+                self.view.marco_trabajo.viewport().update()
+            except Exception:
+                pass
 
             # 2) Quitar del modelo por identidad o por id
             nodo_encontrado = False
@@ -3428,10 +4699,7 @@ class EditorController(QObject):
                         item = self.view.nodosList.item(i)
                         widget = self.view.nodosList.itemWidget(item)
                         if widget and hasattr(widget, 'nodo_id') and widget.nodo_id == nodo_id:
-                            self.view.propertiesTable.clear()
-                            self.view.propertiesTable.setRowCount(0)
-                            self.view.propertiesTable.setColumnCount(2)
-                            self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
+                            self._limpiar_propiedades()
                             break
             except Exception:
                 pass
@@ -3499,7 +4767,6 @@ class EditorController(QObject):
                 nuevas_rutas.append(ruta)
                 continue
             
-            print(f"Reconfigurando ruta - Nodo eliminado en posición: {posicion_en_ruta}")
             
             # RECONFIGURACIÓN SEGÚN POSICIÓN
             if posicion_en_ruta == "origen":
@@ -3508,93 +4775,72 @@ class EditorController(QObject):
                     nuevo_origen = visita[0]
                     nueva_visita = visita[1:]  # resto de la visita
                     nuevo_destino = destino
-                    
+
                     ruta_dict["origen"] = nuevo_origen
                     ruta_dict["visita"] = nueva_visita
                     ruta_dict["destino"] = nuevo_destino
-                    
+
                     # Verificar si la ruta queda con al menos 2 nodos
                     if self._ruta_tiene_al_menos_dos_nodos(ruta_dict):
                         nuevas_rutas.append(ruta_dict)
-                        print(f"  -> Nuevo origen: {nuevo_origen.get('id')}")
-                    else:
-                        print("  -> Ruta eliminada (queda con menos de 2 nodos)")
                 else:
                     # No hay visita, el destino pasa a ser el nuevo origen
                     if destino:
                         ruta_dict["origen"] = destino
                         ruta_dict["visita"] = []
                         ruta_dict["destino"] = None
-                        
+
                         # Verificar si la ruta queda con al menos 2 nodos
                         if self._ruta_tiene_al_menos_dos_nodos(ruta_dict):
                             nuevas_rutas.append(ruta_dict)
-                            print(f"  -> Destino {destino.get('id')} pasa a ser origen")
-                        else:
-                            print("  -> Ruta eliminada (queda con solo un nodo)")
-                    else:
-                        # No hay destino, la ruta queda inválida - se elimina
-                        print("  -> Ruta eliminada (sin origen ni destino válido)")
-            
+                    # else: No hay destino, la ruta queda inválida - se elimina
+
             elif posicion_en_ruta == "destino":
                 # Si es el destino: tomar último elemento de visita como nuevo destino
                 if visita:
                     nuevo_origen = origen
                     nueva_visita = visita[:-1]  # todos menos el último
                     nuevo_destino = visita[-1]  # último elemento
-                    
+
                     ruta_dict["origen"] = nuevo_origen
                     ruta_dict["visita"] = nueva_visita
                     ruta_dict["destino"] = nuevo_destino
-                    
+
                     # Verificar si la ruta queda con al menos 2 nodos
                     if self._ruta_tiene_al_menos_dos_nodos(ruta_dict):
                         nuevas_rutas.append(ruta_dict)
-                        print(f"  -> Nuevo destino: {nuevo_destino.get('id')}")
-                    else:
-                        print("  -> Ruta eliminada (queda con menos de 2 nodos)")
                 else:
                     # No hay visita, el origen pasa a ser el nuevo destino
                     if origen:
                         ruta_dict["origen"] = None
                         ruta_dict["visita"] = []
                         ruta_dict["destino"] = origen
-                        
+
                         # Verificar si la ruta queda con al menos 2 nodos
                         if self._ruta_tiene_al_menos_dos_nodos(ruta_dict):
                             nuevas_rutas.append(ruta_dict)
-                            print(f"  -> Origen {origen.get('id')} pasa a ser destino")
-                        else:
-                            print("  -> Ruta eliminada (queda con solo un nodo)")
-                    else:
-                        # No hay origen, la ruta queda inválida - se elimina
-                        print("  -> Ruta eliminada (sin origen ni destino válido)")
-            
+                    # else: No hay origen, la ruta queda inválida - se elimina
+
             elif posicion_en_ruta.startswith("visita_"):
                 # Si es intermedio: eliminar de la visita y mantener conexión
                 posicion = int(posicion_en_ruta.split("_")[1])
-                
+
                 nuevo_origen = origen
                 nueva_visita = [n for i, n in enumerate(visita) if i != posicion]
                 nuevo_destino = destino
-                
+
                 ruta_dict["origen"] = nuevo_origen
                 ruta_dict["visita"] = nueva_visita
                 ruta_dict["destino"] = nuevo_destino
-                
+
                 # Verificar si la ruta queda con al menos 2 nodos
                 if self._ruta_tiene_al_menos_dos_nodos(ruta_dict):
                     nuevas_rutas.append(ruta_dict)
-                    print(f"  -> Nodo intermedio eliminado de visita, nueva longitud: {len(nueva_visita)}")
-                else:
-                    print("  -> Ruta eliminada (queda con menos de 2 nodos después de eliminar visita)")
-            
+
             else:
                 # Caso por defecto - mantener la ruta si tiene al menos 2 nodos
                 if self._ruta_tiene_al_menos_dos_nodos(ruta_dict):
                     nuevas_rutas.append(ruta)
-                else:
-                    print("  -> Ruta eliminada (queda con menos de 2 nodos)")
         
         # Actualizar las rutas del proyecto
         try:
@@ -3839,11 +5085,11 @@ class EditorController(QObject):
     def on_nodo_moved(self, nodo_item):
         """Versión CORREGIDA para actualización en tiempo real durante arrastre"""
         try:
+            self.proyecto_modificado = True
             # Verificar que estamos en modo mover
             if self.modo_actual != "mover":
                 return
                 
-            print(f"DEBUG on_nodo_moved: Llamado para nodo_item tipo {type(nodo_item)}")
             
             nodo = getattr(nodo_item, "nodo", None)
             if not nodo:
@@ -3861,18 +5107,14 @@ class EditorController(QObject):
             # Método 1: Intentar obtener directamente del nodo
             if isinstance(nodo, dict):
                 nodo_id = nodo.get("id")
-                print(f"DEBUG on_nodo_moved: nodo es dict, id={nodo_id}")
             elif hasattr(nodo, "get"):
                 nodo_id = nodo.get("id")
-                print(f"DEBUG on_nodo_moved: nodo tiene get(), id={nodo_id}")
             elif hasattr(nodo, "id"):
                 nodo_id = getattr(nodo, "id")
-                print(f"DEBUG on_nodo_moved: nodo tiene atributo id, id={nodo_id}")
             
             # Método 2: Si aún no tenemos ID, intentar del nodo_item
             if nodo_id is None and hasattr(nodo_item, "nodo_id"):
                 nodo_id = getattr(nodo_item, "nodo_id", None)
-                print(f"DEBUG on_nodo_moved: Obteniendo de nodo_item.nodo_id={nodo_id}")
             
             # Método 3: Último recurso - buscar en el proyecto
             if nodo_id is None and self.proyecto:
@@ -3880,38 +5122,66 @@ class EditorController(QObject):
                     # Comparar por referencia o por posición
                     if n is nodo or (isinstance(n, dict) and n.get('X') == x and n.get('Y') == y):
                         nodo_id = n.get('id') if isinstance(n, dict) else getattr(n, 'id', None)
-                        print(f"DEBUG on_nodo_moved: Encontrado por referencia, id={nodo_id}")
                         break
 
             if nodo_id is None:
                 print(f"ERROR: No se pudo obtener ID del nodo. Tipo nodo: {type(nodo)}")
                 # Intentar una última opción: si el nodo tiene __dict__
                 if hasattr(nodo, "__dict__"):
-                    print(f"DEBUG: __dict__ del nodo: {nodo.__dict__}")
                     if 'id' in nodo.__dict__:
                         nodo_id = nodo.__dict__['id']
-                        print(f"DEBUG: Encontrado id en __dict__: {nodo_id}")
                 
                 if nodo_id is None:
                     return
 
-            print(f"DEBUG: Nodo {nodo_id} moviéndose a ({x}, {y})")
             
             # ACTUALIZACIÓN EN TIEMPO REAL de todas las rutas que contienen este nodo
             self._actualizar_rutas_con_nodo_en_tiempo_real(nodo_id, x, y)
-            
+
+            # ACTUALIZACIÓN EN TIEMPO REAL de la tabla de propiedades
+            self._actualizar_propiedades_en_tiempo_real(nodo, x, y)
+
         except Exception as err:
             print(f"ERROR en on_nodo_moved: {err}")
             import traceback
             traceback.print_exc()
 
+    def _actualizar_propiedades_en_tiempo_real(self, nodo, x, y):
+        """Actualiza solo X e Y en la tabla de propiedades durante el arrastre"""
+        try:
+            tabla = self.view.propertiesTable
+            tabla.blockSignals(True)
+
+            # Convertir pixeles a metros (con offset)
+            x_metros = self.x_px_a_metros(x)
+            y_metros = self.y_px_a_metros(y)
+
+            # Buscar las filas de X e Y y actualizar solo esas celdas
+            for row in range(tabla.rowCount()):
+                key_item = tabla.item(row, 0)
+                if key_item:
+                    clave = key_item.text()
+                    if clave == "X":
+                        val_item = tabla.item(row, 1)
+                        if val_item:
+                            val_item.setText(str(x_metros))
+                    elif clave == "Y":
+                        val_item = tabla.item(row, 1)
+                        if val_item:
+                            val_item.setText(str(y_metros))
+
+            tabla.blockSignals(False)
+        except Exception as err:
+            try:
+                self.view.propertiesTable.blockSignals(False)
+            except Exception:
+                pass
+
     def _actualizar_rutas_con_nodo_en_tiempo_real(self, nodo_id, x, y):
         """Actualiza TODAS las rutas que contienen el nodo movido, usando las coordenadas en tiempo real"""
         if not getattr(self, "proyecto", None) or not hasattr(self.proyecto, "rutas"):
-            print("DEBUG: No hay proyecto o rutas")
             return
         
-        print(f"DEBUG: Actualizando rutas para nodo {nodo_id} en ({x}, {y})")
         
         # Buscar todas las rutas que contienen este nodo
         rutas_a_actualizar = []
@@ -3937,19 +5207,16 @@ class EditorController(QObject):
                 # Verificar origen
                 if ruta_dict.get("origen") and comparar_ids(ruta_dict["origen"], nodo_id):
                     contiene_nodo = True
-                    print(f"DEBUG: Ruta {idx} contiene nodo {nodo_id} como ORIGEN")
                 
                 # Verificar destino
                 if not contiene_nodo and ruta_dict.get("destino") and comparar_ids(ruta_dict["destino"], nodo_id):
                     contiene_nodo = True
-                    print(f"DEBUG: Ruta {idx} contiene nodo {nodo_id} como DESTINO")
                 
                 # Verificar visita
                 if not contiene_nodo:
                     for nodo_visita in ruta_dict.get("visita", []):
                         if comparar_ids(nodo_visita, nodo_id):
                             contiene_nodo = True
-                            print(f"DEBUG: Ruta {idx} contiene nodo {nodo_id} en VISITA")
                             break
                 
                 if contiene_nodo:
@@ -3960,18 +5227,8 @@ class EditorController(QObject):
         
         # Si no hay rutas que actualizar, salir
         if not rutas_a_actualizar:
-            print(f"DEBUG: No se encontraron rutas que contengan el nodo {nodo_id}")
-            # Mostrar todas las rutas para debug
-            print("DEBUG: Rutas disponibles:")
-            for idx, ruta in enumerate(self.proyecto.rutas):
-                try:
-                    ruta_dict = ruta.to_dict() if hasattr(ruta, "to_dict") else ruta
-                    print(f"  Ruta {idx}: {ruta_dict}")
-                except:
-                    print(f"  Ruta {idx}: ERROR al convertir")
             return
         
-        print(f"DEBUG: Encontradas {len(rutas_a_actualizar)} rutas para actualizar")
         
         # Actualizar las líneas de TODAS las rutas afectadas
         self._actualizar_lineas_rutas_en_tiempo_real(rutas_a_actualizar, nodo_id, x, y)
@@ -4015,28 +5272,27 @@ class EditorController(QObject):
             route_line_items = []
             for i in range(len(puntos) - 1):
                 n1, n2 = puntos[i], puntos[i + 1]
-                
-                # --- OBTENER ES_CURVA DEL NODO ACTUAL ---
-                es_curva_valor = 0
-                # Extraer ID del nodo destino
+
+                # --- OBTENER Tipo_curva DEL NODO DESTINO ---
+                tipo_curva_valor = 0
                 nodo_id_dest = None
                 if isinstance(n2, dict):
                     nodo_id_dest = n2.get('id')
                 elif hasattr(n2, 'get'):
                     nodo_id_dest = n2.get('id')
-                
+
                 if nodo_id_dest is not None:
                     nodo_actual = self._obtener_nodo_actual(nodo_id_dest)
                     if nodo_actual:
                         raw = nodo_actual.get('Tipo_curva', 0)
                         try:
-                            es_curva_valor = int(raw)
+                            tipo_curva_valor = int(raw)
                         except (ValueError, TypeError):
-                            es_curva_valor = 0
-                # -----------------------------------------
-                
+                            tipo_curva_valor = 0
+                # -------------------------------------------
+
                 segment_pen = QPen(base_pen)
-                if es_curva_valor != 0:
+                if tipo_curva_valor != 0:
                     segment_pen.setStyle(Qt.DashLine)
                 else:
                     segment_pen.setStyle(Qt.SolidLine)
@@ -4064,7 +5320,7 @@ class EditorController(QObject):
         self.view.marco_trabajo.viewport().update()
 
     def _actualizar_coordenadas_en_ruta(self, ruta_dict, nodo_id, x, y):
-        """Actualiza las coordenadas de un nodo específico en una ruta"""
+        """Actualiza las coordenadas de un nodo específico en una ruta (en TODOS los roles)"""
         # Actualizar origen
         if ruta_dict.get("origen") and self._obtener_id_de_nodo(ruta_dict["origen"]) == nodo_id:
             if isinstance(ruta_dict["origen"], dict):
@@ -4072,25 +5328,23 @@ class EditorController(QObject):
                 ruta_dict["origen"]["Y"] = y
             elif hasattr(ruta_dict["origen"], "update"):
                 ruta_dict["origen"].update({"X": x, "Y": y})
-        
-        # Actualizar destino
-        elif ruta_dict.get("destino") and self._obtener_id_de_nodo(ruta_dict["destino"]) == nodo_id:
+
+        # Actualizar destino (siempre verificar, no elif)
+        if ruta_dict.get("destino") and self._obtener_id_de_nodo(ruta_dict["destino"]) == nodo_id:
             if isinstance(ruta_dict["destino"], dict):
                 ruta_dict["destino"]["X"] = x
                 ruta_dict["destino"]["Y"] = y
             elif hasattr(ruta_dict["destino"], "update"):
                 ruta_dict["destino"].update({"X": x, "Y": y})
-        
-        # Actualizar visita
-        else:
-            for nodo_visita in ruta_dict.get("visita", []):
-                if self._obtener_id_de_nodo(nodo_visita) == nodo_id:
-                    if isinstance(nodo_visita, dict):
-                        nodo_visita["X"] = x
-                        nodo_visita["Y"] = y
-                    elif hasattr(nodo_visita, "update"):
-                        nodo_visita.update({"X": x, "Y": y})
-                    break
+
+        # Actualizar visita (siempre verificar, no else)
+        for nodo_visita in ruta_dict.get("visita", []):
+            if self._obtener_id_de_nodo(nodo_visita) == nodo_id:
+                if isinstance(nodo_visita, dict):
+                    nodo_visita["X"] = x
+                    nodo_visita["Y"] = y
+                elif hasattr(nodo_visita, "update"):
+                    nodo_visita.update({"X": x, "Y": y})
 
     def _obtener_puntos_de_ruta(self, ruta_dict):
         """Obtiene todos los puntos de una ruta en orden"""
@@ -4313,40 +5567,51 @@ class EditorController(QObject):
         if hasattr(self.view, "rutasList") and self.view.rutasList.selectedItems():
             self.seleccionar_ruta_desde_lista()
 
-    # --- Event filter para deselección al clicar en fondo ---
-    def eventFilter(self, obj, event):
+    # --- Event filter (NOTA: sobrescrito por el segundo eventFilter más abajo;
+    #     conservado para referencia, no se ejecuta) ---
+    def _eventFilter_deprecated(self, obj, event):
        # Detectar teclas presionadas
         if event.type() == QEvent.KeyPress:
             # Pasar el evento a keyPressEvent para manejo centralizado
             self.keyPressEvent(event)
             return True
         
-        # Detectar movimiento del ratón para actualizar cursor dinámicamente
+        # Detectar movimiento del ratón para actualizar cursor y coordenadas
         if event.type() == QEvent.MouseMove:
             # Obtener posición actual del ratón
             pos = self.view.marco_trabajo.mapToScene(event.pos())
             items = self.scene.items(pos)
-            
+
+            # Actualizar coordenadas en la barra inferior (con offset, limitado al mapa)
+            x_m = self.x_px_a_metros(pos.x())
+            y_m = self.y_px_a_metros(pos.y())
+            self.view.actualizar_coordenadas(x_m, y_m)
+
+            # Si el modo duplicar está activo: los ghosts siguen al cursor
+            # solo cuando está sobre zona vacía (no sobre un nodo).
+            if getattr(self, "_modo_duplicar_activo", False):
+                hay_nodo = any(isinstance(it, NodoItem) for it in items)
+                if hay_nodo:
+                    self._ocultar_ghosts_duplicar()
+                else:
+                    self._mover_ghosts_duplicar(pos.x(), pos.y())
+
             # Verificar si hay nodos en la posición actual
             hay_nodo = any(isinstance(it, NodoItem) for it in items)
-            
+
             # Actualizar estado de hover
             if hay_nodo and not self._cursor_sobre_nodo:
-                # El ratón acaba de entrar en un nodo
                 self._cursor_sobre_nodo = True
-                print(f"MouseMove: Entrando en nodo, sobre_nodo=True")
                 self._actualizar_cursor()
             elif not hay_nodo and self._cursor_sobre_nodo:
-                # El ratón acaba de salir de un nodo
                 self._cursor_sobre_nodo = False
-                print(f"MouseMove: Saliendo de nodo, sobre_nodo=False")
                 self._actualizar_cursor()
         
         # Detectar click izquierdo en el viewport
         if event.type() == QEvent.MouseButtonPress:
             # Mapear a escena
             pos = self.view.marco_trabajo.mapToScene(event.pos())
-            
+
             # PRIMERO: Si estamos en modo ruta o modo colocar, NO manejar el clic aquí
             # Los controladores respectivos manejarán los clics a través de su eventFilter
             if self.modo_actual in ["ruta", "colocar"]:
@@ -4356,11 +5621,9 @@ class EditorController(QObject):
             items = self.scene.items(pos)
             if not any(isinstance(it, NodoItem) for it in items):
                 # Click fuera de nodo
-                print("CLICK FUERA DE NODO - Forzar estado normal")
                 
                 # Resetear estados de cursor
                 if self._arrastrando_nodo:
-                    print("Forzando fin de arrastre")
                     self._arrastrando_nodo = False
                 
                 self._cursor_sobre_nodo = False
@@ -4389,26 +5652,21 @@ class EditorController(QObject):
                         pass
                 
                 self._clear_highlight_lines()
-                
+
                 try:
-                    self.view.propertiesTable.clear()
-                    self.view.propertiesTable.setRowCount(0)
-                    self.view.propertiesTable.setColumnCount(2)
-                    self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
+                    self._limpiar_propiedades()
                 except Exception:
                     pass
-                
+
                 for item in self.scene.items():
                     if isinstance(item, NodoItem):
                         item.set_normal_color()
         
         # NUEVO: Detectar liberación del botón del ratón
         if event.type() == QEvent.MouseButtonRelease:
-            print("MouseButtonRelease detectado - Forzar actualización de cursor")
             # Resetear estado de arrastre si aún está activo
             if self._arrastrando_nodo:
                 self._arrastrando_nodo = False
-                print("Resetear arrastre desde eventFilter")
             
             # Forzar actualización del cursor
             self._actualizar_cursor()
@@ -4417,57 +5675,9 @@ class EditorController(QObject):
 
     def diagnosticar_estado_proyecto(self):
         """Diagnóstico completo del estado del proyecto"""
-        print("\n" + "="*50)
-        print("DIAGNÓSTICO COMPLETO DEL PROYECTO")
-        print("="*50)
-        
         if not self.proyecto:
-            print("No hay proyecto cargado")
             return
-            
-        print(f"Nodos en proyecto: {len(getattr(self.proyecto, 'nodos', []))}")
-        for i, nodo in enumerate(getattr(self.proyecto, "nodos", [])):
-            try:
-                # Usar nodo.get() para objetos Nodo
-                if hasattr(nodo, 'get'):
-                    nodo_id = nodo.get('id', "N/A")
-                    x_px = nodo.get('X', "N/A")
-                    y_px = nodo.get('Y', "N/A")
-                    objetivo = nodo.get('objetivo', "N/A")
-                else:
-                    nodo_id = nodo.get('id', "N/A") if isinstance(nodo, dict) else "N/A"
-                    x_px = nodo.get('X', "N/A") if isinstance(nodo, dict) else "N/A"
-                    y_px = nodo.get('Y', "N/A") if isinstance(nodo, dict) else "N/A"
-                    objetivo = nodo.get('objetivo', "N/A") if isinstance(nodo, dict) else "N/A"
-                
-                # Convertir a metros para mostrar
-                if isinstance(x_px, (int, float)) and isinstance(y_px, (int, float)):
-                    x_m = self.pixeles_a_metros(x_px)
-                    y_m = self.pixeles_a_metros(y_px)
-                    coords_text = f"({x_m:.2f}, {y_m:.2f}) metros"
-                else:
-                    coords_text = f"({x_px}, {y_px}) píxeles"
-                
-                texto_objetivo = "IN" if objetivo == 1 else "OUT" if objetivo == 2 else "I/O" if objetivo == 3 else "Sin objetivo"
-                print(f"  Nodo {i}: ID {nodo_id} - {texto_objetivo} {coords_text}")
-            except Exception as e:
-                print(f"  Nodo {i}: ERROR - {e}")
-        
-        print(f"Rutas en proyecto: {len(getattr(self.proyecto, 'rutas', []))}")
-        for i, ruta in enumerate(getattr(self.proyecto, "rutas", [])):
-            try:
-                ruta_dict = ruta.to_dict() if hasattr(ruta, "to_dict") else ruta
-                origen = ruta_dict.get("origen", {})
-                destino = ruta_dict.get("destino", {})
-                
-                # Usar .get() para diccionarios
-                origen_id = origen.get("id", "N/A") if isinstance(origen, dict) else "N/A"
-                destino_id = destino.get("id", "N/A") if isinstance(destino, dict) else "N/A"
-                print(f"  Ruta {i}: Origen {origen_id} -> Destino {destino_id}")
-            except Exception as e:
-                print(f"  Ruta {i}: ERROR - {e}")
-        
-        print("="*50)
+        # Method kept for compatibility but prints removed
 
     # --- SISTEMA DE VISIBILIDAD CON LÓGICA DE RUTAS INCLUYENDO NODOS ---
     def inicializar_visibilidad(self):
@@ -4475,19 +5685,16 @@ class EditorController(QObject):
         if not self.proyecto:
             return
         
-        print("Inicializando sistema de visibilidad...")
         
         # Inicializar visibilidad de nodos como VISIBLES (True)
         for nodo in self.proyecto.nodos:
             nodo_id = nodo.get('id')
             if nodo_id is not None:
                 self.visibilidad_nodos[nodo_id] = True  # Inicialmente visibles
-                print(f"  - Nodo {nodo_id}: visibilidad = True")
         
         # Inicializar visibilidad de rutas como VISIBLES (True)
         for idx in range(len(self.proyecto.rutas)):
             self.visibilidad_rutas[idx] = True  # Inicialmente visibles
-            print(f"  - Ruta {idx}: visibilidad = True")
             
         # Inicializar relaciones nodo-ruta
         self._actualizar_todas_relaciones_nodo_ruta()
@@ -4503,7 +5710,6 @@ class EditorController(QObject):
             self.view.btnMostrarTodo.setText("Ocultar Rutas")
             self.view.btnMostrarTodo.setEnabled(True)  # Habilitado porque nodos visibles
         
-        print("✓ Sistema de visibilidad inicializado")
 
     # --- NUEVOS MÉTODOS PARA INTERRUPTORES DE VISIBILIDAD ---
     def toggle_visibilidad_nodos(self):
@@ -4539,7 +5745,6 @@ class EditorController(QObject):
         # Verificar que los nodos estén visibles
         nodos_visibles = any(self.visibilidad_nodos.values()) if self.visibilidad_nodos else False
         if not nodos_visibles:
-            print("⚠ No se pueden mostrar/ocultar rutas porque los nodos están ocultos")
             return
         
         # Verificar si actualmente las rutas están visibles
@@ -4556,7 +5761,6 @@ class EditorController(QObject):
 
     def ocultar_todos_los_nodos(self):
         """Oculta TODOS los nodos y TODAS las rutas"""
-        print("Ocultando todos los nodos y rutas...")
         
         # Ocultar todos los nodos en la escena
         for item in self.scene.items():
@@ -4586,21 +5790,16 @@ class EditorController(QObject):
         self.ruta_actual_idx = None
         
         # Limpiar tabla de propiedades
-        self.view.propertiesTable.clear()
-        self.view.propertiesTable.setRowCount(0)
-        self.view.propertiesTable.setColumnCount(2)
-        self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
-        
+        self._limpiar_propiedades()
+
         # Restaurar colores normales de TODOS los nodos
         for item in self.scene.items():
             if isinstance(item, NodoItem):
                 item.set_normal_color()
         
-        print("✓ Todos los nodos y rutas ocultados")
 
     def mostrar_todos_los_nodos_y_rutas(self):
         """Muestra TODOS los nodos y TODAS las rutas (fuerza mostrar rutas)"""
-        print("Mostrando todos los nodos y rutas...")
         
         # Mostrar todos los nodos en la escena
         for item in self.scene.items():
@@ -4621,11 +5820,9 @@ class EditorController(QObject):
         # Redibujar rutas
         self._dibujar_rutas()
         
-        print("✓ Todos los nodos y rutas mostrados")
 
     def ocultar_todas_las_rutas(self):
         """Oculta solo las líneas de las rutas, manteniendo los nodos visibles"""
-        print("Ocultando todas las rutas (líneas)...")
         
         # Ocultar todas las rutas
         for idx in range(len(self.proyecto.rutas)):
@@ -4650,11 +5847,9 @@ class EditorController(QObject):
             if isinstance(item, NodoItem):
                 item.set_normal_color()
         
-        print("✓ Todas las rutas (líneas) ocultadas")
 
     def mostrar_todas_las_rutas(self):
         """Muestra todas las líneas de las rutas (solo si los nodos están visibles)"""
-        print("Mostrando todas las rutas (líneas)...")
         
         # Mostrar todas las rutas
         for idx in range(len(self.proyecto.rutas)):
@@ -4666,7 +5861,6 @@ class EditorController(QObject):
         # Actualizar widgets en la lista de rutas
         self._actualizar_lista_rutas_con_widgets()
         
-        print("✓ Todas las rutas (líneas) mostradas")
 
     # --- MÉTODOS COMPATIBLES (actualizados) ---
     def ocultar_todo(self):
@@ -4767,7 +5961,6 @@ class EditorController(QObject):
         for nodo in self.proyecto.nodos:
             self._inicializar_nodo_visibilidad(nodo, agregar_a_lista=True)
         
-        print(f"✓ Lista de nodos actualizada con widgets ({self.view.nodosList.count()} nodos)")
     
     def _actualizar_lista_rutas_con_widgets(self):
         """Actualiza la lista de rutas con widgets personalizados"""
@@ -4807,19 +6000,69 @@ class EditorController(QObject):
                 self.visibilidad_rutas.get(idx, True)
             )
             widget.toggle_visibilidad.connect(self.toggle_visibilidad_ruta)
-            
+            widget.solicitar_eliminacion.connect(self._confirmar_eliminar_ruta)
+
             self.view.rutasList.addItem(item)
             self.view.rutasList.setItemWidget(item, widget)
         
-        print(f"✓ Lista de rutas actualizada con widgets ({self.view.rutasList.count()} rutas)")
     
+    def _confirmar_eliminar_ruta(self, ruta_index):
+        """Muestra diálogo de confirmación y elimina la ruta si el usuario acepta"""
+        if not self.proyecto or ruta_index >= len(self.proyecto.rutas):
+            return
+
+        # Obtener info de la ruta para el mensaje
+        ruta = self.proyecto.rutas[ruta_index]
+        ruta_dict = ruta.to_dict() if hasattr(ruta, "to_dict") else ruta
+        nombre = ruta_dict.get("nombre", "Ruta")
+        origen = ruta_dict.get("origen", {})
+        destino = ruta_dict.get("destino", {})
+        origen_id = origen.get("id", "?") if isinstance(origen, dict) else str(origen)
+        destino_id = destino.get("id", "?") if isinstance(destino, dict) else str(destino)
+
+        respuesta = QMessageBox.question(
+            self.view,
+            "Confirmar eliminacion",
+            f"Desea eliminar la ruta '{nombre}: {origen_id} -> {destino_id}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if respuesta == QMessageBox.Yes:
+            # Limpiar highlights si la ruta eliminada estaba seleccionada
+            if self.ruta_actual_idx == ruta_index:
+                self._clear_highlight_lines()
+                self.ruta_actual_idx = None
+
+            # Ajustar índice de ruta seleccionada si es necesario
+            elif self.ruta_actual_idx is not None and self.ruta_actual_idx > ruta_index:
+                self.ruta_actual_idx -= 1
+
+            # Eliminar del diccionario de visibilidad
+            if ruta_index in self.visibilidad_rutas:
+                del self.visibilidad_rutas[ruta_index]
+            # Reindexar visibilidad para rutas posteriores
+            nuevas_vis = {}
+            for k, v in self.visibilidad_rutas.items():
+                if k > ruta_index:
+                    nuevas_vis[k - 1] = v
+                else:
+                    nuevas_vis[k] = v
+            self.visibilidad_rutas = nuevas_vis
+
+            # Eliminar la ruta del modelo
+            self.proyecto.eliminar_ruta(ruta_index)
+
+            # Redibujar y actualizar lista
+            self._dibujar_rutas()
+            self._actualizar_lista_rutas_con_widgets()
+
     def ocultar_todo(self):
         """Oculta todos los nodos y rutas de la interfaz"""
         if not self.proyecto:
             QMessageBox.warning(self.view, "Advertencia", "No hay proyecto cargado")
             return
         
-        print("Ocultando todos los elementos...")
         
         # Ocultar todos los nodos en la escena
         for item in self.scene.items():
@@ -4849,17 +6092,13 @@ class EditorController(QObject):
         self.ruta_actual_idx = None
         
         # Limpiar tabla de propiedades
-        self.view.propertiesTable.clear()
-        self.view.propertiesTable.setRowCount(0)
-        self.view.propertiesTable.setColumnCount(2)
-        self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
-        
+        self._limpiar_propiedades()
+
         # Restaurar colores normales de todos los nodos
         for item in self.scene.items():
             if isinstance(item, NodoItem):
                 item.set_normal_color()
-        
-        print("✓ Todos los elementos ocultados")
+
     
     def mostrar_todo(self):
         """Muestra todos los nodos y rutas de la interfaz"""
@@ -4867,7 +6106,6 @@ class EditorController(QObject):
             QMessageBox.warning(self.view, "Advertencia", "No hay proyecto cargado")
             return
         
-        print("Mostrando todos los elementos...")
         
         # Mostrar todos los nodos en la escena
         for item in self.scene.items():
@@ -4888,7 +6126,6 @@ class EditorController(QObject):
         self._actualizar_lista_nodos_con_widgets()
         self._actualizar_lista_rutas_con_widgets()
         
-        print("✓ Todos los elementos mostrados")
     
     def toggle_visibilidad_nodo(self, nodo_id):
         """Alterna la visibilidad de un nodo específico y reconstruye rutas"""
@@ -4915,8 +6152,6 @@ class EditorController(QObject):
         
         if not nuevo_estado:
             # Si estamos OCULTANDO el nodo
-            print(f"Ocultando nodo {nodo_id} - Rutas afectadas: {rutas_con_nodo}")
-            print(f"  Se reconstruirán {len(rutas_con_nodo)} rutas saltando nodo {nodo_id}")
             
             # Si el nodo está siendo ocultado y está seleccionado, deseleccionarlo
             for item in self.scene.selectedItems():
@@ -4935,18 +6170,13 @@ class EditorController(QObject):
             # Limpiar tabla de propiedades si este nodo estaba seleccionado
             seleccionados = self.view.nodosList.selectedItems()
             if not seleccionados:
-                self.view.propertiesTable.clear()
-                self.view.propertiesTable.setRowCount(0)
-                self.view.propertiesTable.setColumnCount(2)
-                self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
+                self._limpiar_propiedades()
         
         else:
             # Si estamos MOSTRANDO el nodo
-            print(f"Mostrando nodo {nodo_id} - Reconstruyendo rutas: {rutas_con_nodo}")
-            print(f"  Se reconstruirán {len(rutas_con_nodo)} rutas incluyendo nodo {nodo_id}")
-            
             # El nodo se incluirá automáticamente en la reconstrucción
-        
+            pass
+
         # Actualizar widget en la lista
         self._actualizar_widget_nodo_en_lista(nodo_id)
         
@@ -4957,8 +6187,6 @@ class EditorController(QObject):
         if self.ruta_actual_idx is not None and self.ruta_actual_idx in rutas_con_nodo:
             self.seleccionar_ruta_desde_lista()
         
-        print(f"✓ Visibilidad nodo {nodo_id}: {nuevo_estado}")
-        print(f"  Rutas reconstruidas: {[i for i in rutas_con_nodo if i < len(self.rutas_para_dibujo) and self.rutas_para_dibujo[i]]}")
         
     def _actualizar_relaciones_nodo_visible(self, nodo_id):
         """Reconstruye relaciones cuando un nodo se vuelve visible"""
@@ -5005,7 +6233,6 @@ class EditorController(QObject):
                 if idx not in self.nodo_en_rutas[nodo_id]:
                     self.nodo_en_rutas[nodo_id].append(idx)
         
-        print(f"✓ Relaciones actualizadas para nodo {nodo_id}: {self.nodo_en_rutas.get(nodo_id, [])}")
 
     def toggle_visibilidad_ruta(self, ruta_index):
         """Alterna la visibilidad de una ruta específica (SOLO líneas, como el botón global)"""
@@ -5047,7 +6274,6 @@ class EditorController(QObject):
         # Actualizar widget en la lista
         self._actualizar_widget_ruta_en_lista(ruta_index)
         
-        print(f"Visibilidad ruta {ruta_index}: {nuevo_estado} (solo líneas)")
     
     def _actualizar_widget_nodo_en_lista(self, nodo_id):
         """Actualiza el widget de un nodo en la lista lateral"""
@@ -5159,7 +6385,7 @@ class EditorController(QObject):
         
         if confirmacion == QMessageBox.Yes:
             # Llamar al exportador pasando la escala
-            ExportadorDB.exportar(self.proyecto, self.view, self.ESCALA)
+            ExportadorDB.exportar(self.proyecto, self.view, self.ESCALA, self.alto_mapa_px, self.offset_x_px, self.offset_y_px)
 
     # En el método exportar_a_csv del EditorController:
     def exportar_a_csv(self):
@@ -5204,7 +6430,7 @@ class EditorController(QObject):
         if tiene_parametros_playa:
             archivos_a_crear.append("parametros_playa.csv (parámetros de playa)")
         if tiene_parametros_carga_descarga:
-            archivos_a_crear.append("tipo_carga_descarga.csv (parámetros de carga/descarga)")
+            archivos_a_crear.append("pasos.csv (parámetros de carga/descarga)")
 
         confirmacion = QMessageBox.question(
             self.view,
@@ -5224,15 +6450,20 @@ class EditorController(QObject):
 
         if confirmacion == QMessageBox.Yes:
             # Llamar al exportador CSV pasando la escala
-            ExportadorCSV.exportar(self.proyecto, self.view, self.ESCALA)
+            ExportadorCSV.exportar(self.proyecto, self.view, self.ESCALA, self.alto_mapa_px, self.offset_x_px, self.offset_y_px)
 
 
     def manejar_seleccion_nodo(self):
         """Maneja la selección de nodos, ajustando z-values para nodos solapados"""
-        seleccionados = self.scene.selectedItems()
-        
+        # Protección contra scene eliminada durante teardown de la app
+        try:
+            seleccionados = self.scene.selectedItems()
+            items = self.scene.items()
+        except RuntimeError:
+            return
+
         # Primero, restaurar todos los nodos a su z-value normal
-        for item in self.scene.items():
+        for item in items:
             if isinstance(item, NodoItem):
                 if not item.isSelected():
                     item.setZValue(1)  # Valor z normal para nodos no seleccionados
@@ -5249,7 +6480,7 @@ class EditorController(QObject):
                 
                 # Buscar nodos en la misma posición
                 nodos_solapados = []
-                for otro_item in self.scene.items():
+                for otro_item in items:
                     if isinstance(otro_item, NodoItem) and otro_item != item:
                         otro_pos = otro_item.scenePos()
                         # Verificar si están muy cerca (dentro de 5 píxeles)
@@ -5377,11 +6608,25 @@ class EditorController(QObject):
             self.keyPressEvent(event)
             return True
 
+        # Detectar liberación de Ctrl en modo duplicar → mostrar fantasmas
+        if event.type() == QEvent.KeyRelease:
+            if getattr(self, "_modo_duplicar_activo", False) and \
+                    event.key() in (Qt.Key_Control, Qt.Key_Meta):
+                if self._duplicar_items_seleccionados and not self._duplicar_ghost_items:
+                    self._crear_ghosts_duplicar()
+
         # Detectar movimiento del ratón para actualizar cursor dinámicamente
         if event.type() == QEvent.MouseMove:
             pos = self.view.marco_trabajo.mapToScene(event.pos())
             items = self.scene.items(pos)
             hay_nodo = any(isinstance(it, NodoItem) for it in items)
+
+            # --- MODO DUPLICAR: mover los fantasmas con el cursor ---
+            if getattr(self, "_modo_duplicar_activo", False):
+                if hay_nodo:
+                    self._ocultar_ghosts_duplicar()
+                else:
+                    self._mover_ghosts_duplicar(pos.x(), pos.y())
 
             if hay_nodo and not self._cursor_sobre_nodo:
                 self._cursor_sobre_nodo = True
@@ -5395,6 +6640,25 @@ class EditorController(QObject):
             pos = self.view.marco_trabajo.mapToScene(event.pos())
             items = self.scene.items(pos)
             hay_nodo = any(isinstance(it, NodoItem) for it in items)
+
+            # --- MODO DUPLICAR ---
+            # - Click izquierdo sobre nodo (sin Ctrl): reemplaza selección
+            # - Ctrl+click sobre nodo: toggle
+            # - Click izquierdo sobre zona vacía (sin Ctrl): coloca duplicados
+            if getattr(self, "_modo_duplicar_activo", False):
+                if event.button() == Qt.LeftButton:
+                    nodo_bajo_cursor = next(
+                        (it for it in items if isinstance(it, NodoItem)), None
+                    )
+                    con_ctrl = bool(event.modifiers() & Qt.ControlModifier)
+                    if nodo_bajo_cursor is not None:
+                        self._duplicar_click_nodo(nodo_bajo_cursor, con_ctrl)
+                    else:
+                        if not con_ctrl:
+                            self._duplicar_colocar_en(pos.x(), pos.y())
+                    return True
+                # Otros botones en modo duplicar: consumir
+                return True
 
             # --- MODO MOVER: comportamiento dual con botón izquierdo ---
             if self.modo_actual == "mover" and event.button() == Qt.LeftButton:
@@ -5448,10 +6712,7 @@ class EditorController(QObject):
 
                 # Limpiar tabla de propiedades
                 try:
-                    self.view.propertiesTable.clear()
-                    self.view.propertiesTable.setRowCount(0)
-                    self.view.propertiesTable.setColumnCount(2)
-                    self.view.propertiesTable.setHorizontalHeaderLabels(["Propiedad", "Valor"])
+                    self._limpiar_propiedades()
                 except Exception:
                     pass
 
@@ -5479,11 +6740,31 @@ class EditorController(QObject):
         return False
     
     # --- OBSERVER PATTERN: MÉTODOS PARA ACTUALIZACIÓN AUTOMÁTICA ---
+    def _desconectar_señales_proyecto(self, proyecto=None):
+        """Desconecta las señales del proyecto para evitar slots huérfanos"""
+        proy = proyecto or self.proyecto
+        if not proy:
+            return
+        for signal, slot in [
+            (proy.nodo_agregado, self._on_nodo_agregado),
+            (proy.nodo_modificado, self._on_nodo_modificado),
+            (proy.ruta_agregada, self._on_ruta_agregada),
+            (proy.ruta_modificada, self._on_ruta_modificada),
+            (proy.proyecto_cambiado, self._on_proyecto_cambiado),
+        ]:
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+
     def _conectar_señales_proyecto(self):
         """Conecta las señales del proyecto para actualizar la UI automáticamente"""
         if not self.proyecto:
             return
-        
+
+        # Desconectar primero por si ya estaban conectadas (evita duplicados)
+        self._desconectar_señales_proyecto()
+
         # Conectar señales de cambios
         self.proyecto.nodo_agregado.connect(self._on_nodo_agregado)
         self.proyecto.nodo_modificado.connect(self._on_nodo_modificado)
@@ -5493,7 +6774,6 @@ class EditorController(QObject):
     
     def _on_nodo_agregado(self, nodo):
         """Se llama automáticamente cuando se agrega un nuevo nodo"""
-        print(f"Observer: Nodo {nodo.get('id')} agregado, actualizando UI...")
         
         # Inicializar visibilidad del nodo
         self._inicializar_nodo_visibilidad(nodo, agregar_a_lista=True)
@@ -5503,21 +6783,29 @@ class EditorController(QObject):
     
     def _on_nodo_modificado(self, nodo):
         """Se llama automáticamente cuando se modifica un nodo"""
-        print(f"Observer: Nodo {nodo.get('id')} modificado, actualizando UI...")
-        
-        # Actualizar lista lateral del nodo
-        self.actualizar_lista_nodo(nodo)
-        
-        # Actualizar propiedades si el nodo está seleccionado
-        seleccionados = self.view.nodosList.selectedItems()
-        for i in range(self.view.nodosList.count()):
-            item = self.view.nodosList.item(i)
-            widget = self.view.nodosList.itemWidget(item)
-            if widget and hasattr(widget, 'nodo_id') and widget.nodo_id == nodo.get('id'):
-                if item.isSelected():
-                    self.mostrar_propiedades_nodo(nodo)
-                break
-        
+
+        # Si la modificación viene desde la tabla de propiedades, NO refrescar
+        # la tabla: rebuild destruiría la celda que el usuario está editando
+        # (provocaba que al cambiar Y se "moviera" X, etc.)
+        editando_desde_tabla = getattr(self, '_updating_from_table', False)
+
+        if editando_desde_tabla:
+            # Solo actualizar la etiqueta lateral del nodo, sin tocar la tabla
+            self._actualizar_label_lateral_nodo(nodo)
+        else:
+            # Actualizar lista lateral del nodo (puede regenerar la tabla)
+            self.actualizar_lista_nodo(nodo)
+
+            # Actualizar propiedades si el nodo está seleccionado
+            seleccionados = self.view.nodosList.selectedItems()
+            for i in range(self.view.nodosList.count()):
+                item = self.view.nodosList.item(i)
+                widget = self.view.nodosList.itemWidget(item)
+                if widget and hasattr(widget, 'nodo_id') and widget.nodo_id == nodo.get('id'):
+                    if item.isSelected():
+                        self.mostrar_propiedades_nodo(nodo)
+                    break
+
         # Actualizar rutas que contengan este nodo
         self._dibujar_rutas()
         
@@ -5546,12 +6834,10 @@ class EditorController(QObject):
                 # Forzar repintado para cualquier propiedad (incluyendo ángulo "A")
                 item.update()
                 
-                print(f"✓ NodoItem actualizado visualmente para nodo {nodo.get('id')}")
                 break
     
     def _on_ruta_agregada(self, ruta):
         """Se llama automáticamente cuando se agrega una nueva ruta"""
-        print("Observer: Ruta agregada, actualizando UI...")
         
         # Actualizar lista lateral de rutas
         self._actualizar_lista_rutas_con_widgets()
@@ -5564,7 +6850,6 @@ class EditorController(QObject):
     
     def _on_ruta_modificada(self, ruta):
         """Se llama automáticamente cuando se modifica una ruta"""
-        print("Observer: Ruta modificada, actualizando UI...")
         
         # Actualizar lista lateral de rutas
         self._actualizar_lista_rutas_con_widgets()
@@ -5584,11 +6869,11 @@ class EditorController(QObject):
     
     def _on_proyecto_cambiado(self):
         """Se llama automáticamente cuando hay cambios generales en el proyecto"""
-        print("Observer: Proyecto cambiado, actualizando relaciones...")
-        
+        self.proyecto_modificado = True
+
         # Actualizar relaciones nodo-ruta
         self._actualizar_todas_relaciones_nodo_ruta()
-        
+
         # Forzar actualización visual
         self.view.marco_trabajo.viewport().update()
     
@@ -5608,11 +6893,9 @@ class EditorController(QObject):
         if self.modo_actual:
             self._resetear_modo_actual()
         
-        print("✓ Referencias del proyecto actualizadas en todos los controladores")
 
     def forzar_actualizacion_cursor(self):
         """Fuerza la actualización del cursor, útil para debug"""
-        print("=== FORZANDO ACTUALIZACIÓN DE CURSOR ===")
         self._actualizar_cursor()
 
 
@@ -5711,5 +6994,4 @@ class EditorController(QObject):
     
     def forzar_actualizacion_cursor(self):
         """Fuerza la actualización del cursor, útil para debug"""
-        print("=== FORZANDO ACTUALIZACIÓN DE CURSOR ===")
         self._actualizar_cursor()

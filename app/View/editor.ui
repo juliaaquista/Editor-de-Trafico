@@ -49,6 +49,16 @@
         </property>
        </widget>
       </item>
+      <item>
+       <widget class="QPushButton" name="duplicar_nodo_button">
+        <property name="text">
+         <string>Duplicar nodo</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
      </layout>
     </item>
 
@@ -73,110 +83,118 @@
        </widget>
       </widget>
 
-      <!-- Panel derecho: Nodos, Rutas y Propiedades -->
+      <!-- Panel derecho: Nodos, Rutas y Propiedades (redimensionables) -->
       <widget class="QWidget" name="sidePanel">
        <layout class="QVBoxLayout" name="sideLayout">
-
-        <!-- Sección Nodos -->
+        <property name="leftMargin"><number>0</number></property>
+        <property name="topMargin"><number>0</number></property>
+        <property name="rightMargin"><number>0</number></property>
+        <property name="bottomMargin"><number>0</number></property>
         <item>
-         <widget class="QGroupBox" name="groupNodos">
-          <property name="title">
-           <string>Nodos</string>
+         <widget class="QSplitter" name="sideSplitter">
+          <property name="orientation">
+           <enum>Qt::Vertical</enum>
           </property>
-          <layout class="QVBoxLayout" name="nodosLayout">
-           <!-- Botones de visibilidad -->
-           <item>
-            <layout class="QHBoxLayout" name="visibilityButtonsLayout">
-             <item>
-              <widget class="QPushButton" name="btnOcultarTodo">
-               <property name="text">
-                <string>Ocultar todo</string>
-               </property>
-               <property name="minimumHeight">
-                <number>25</number>
-               </property>
-               <property name="maximumWidth">
-                <number>100</number>
-               </property>
-              </widget>
-             </item>
-             <item>
-              <widget class="QPushButton" name="btnMostrarTodo">
-               <property name="text">
-                <string>Mostrar todo</string>
-               </property>
-               <property name="minimumHeight">
-                <number>25</number>
-               </property>
-               <property name="maximumWidth">
-                <number>100</number>
-               </property>
-              </widget>
-             </item>
-            </layout>
-           </item>
-           <!-- Fin botones de visibilidad -->
-           <item>
-            <widget class="QListWidget" name="nodosList"/>
-           </item>
-          </layout>
-         </widget>
-         <property name="stretch">
-          <number>1</number>
-         </property>
-        </item>
+          <property name="childrenCollapsible">
+           <bool>false</bool>
+          </property>
 
-        <!-- Sección Rutas -->
-        <item>
-         <widget class="QGroupBox" name="groupRutas">
-          <property name="title">
-           <string>Rutas</string>
-          </property>
-          <layout class="QVBoxLayout" name="rutasLayout">
-           <item>
-            <widget class="QListWidget" name="rutasList"/>
-           </item>
-          </layout>
-         </widget>
-         <property name="stretch">
-          <number>1</number>
-         </property>
-        </item>
+          <!-- Sección Nodos -->
+          <widget class="QGroupBox" name="groupNodos">
+           <property name="title">
+            <string>Nodos</string>
+           </property>
+           <property name="minimumSize">
+            <size><width>0</width><height>80</height></size>
+           </property>
+           <layout class="QVBoxLayout" name="nodosLayout">
+            <!-- Botones de visibilidad -->
+            <item>
+             <layout class="QHBoxLayout" name="visibilityButtonsLayout">
+              <item>
+               <widget class="QPushButton" name="btnOcultarTodo">
+                <property name="text">
+                 <string>Ocultar todo</string>
+                </property>
+                <property name="minimumHeight">
+                 <number>25</number>
+                </property>
+                <property name="maximumWidth">
+                 <number>100</number>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="btnMostrarTodo">
+                <property name="text">
+                 <string>Mostrar todo</string>
+                </property>
+                <property name="minimumHeight">
+                 <number>25</number>
+                </property>
+                <property name="maximumWidth">
+                 <number>100</number>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <!-- Fin botones de visibilidad -->
+            <item>
+             <widget class="QListWidget" name="nodosList"/>
+            </item>
+           </layout>
+          </widget>
 
-        <!-- Sección Propiedades -->
-        <item>
-         <widget class="QGroupBox" name="groupProperties">
-          <property name="title">
-           <string>Propiedades</string>
-          </property>
-          <layout class="QVBoxLayout" name="propertiesContainer">
-           <item>
-            <widget class="QTableWidget" name="propertiesTable">
-             <property name="columnCount">
-              <number>2</number>
-             </property>
-             <property name="rowCount">
-              <number>0</number>
-             </property>
-             <column>
-              <property name="text">
-               <string>Propiedad</string>
+          <!-- Sección Rutas -->
+          <widget class="QGroupBox" name="groupRutas">
+           <property name="title">
+            <string>Rutas</string>
+           </property>
+           <property name="minimumSize">
+            <size><width>0</width><height>60</height></size>
+           </property>
+           <layout class="QVBoxLayout" name="rutasLayout">
+            <item>
+             <widget class="QListWidget" name="rutasList"/>
+            </item>
+           </layout>
+          </widget>
+
+          <!-- Sección Propiedades -->
+          <widget class="QGroupBox" name="groupProperties">
+           <property name="title">
+            <string>Propiedades</string>
+           </property>
+           <property name="minimumSize">
+            <size><width>0</width><height>80</height></size>
+           </property>
+           <layout class="QVBoxLayout" name="propertiesContainer">
+            <item>
+             <widget class="QTableWidget" name="propertiesTable">
+              <property name="columnCount">
+               <number>2</number>
               </property>
-             </column>
-             <column>
-              <property name="text">
-               <string>Valor</string>
+              <property name="rowCount">
+               <number>0</number>
               </property>
-             </column>
-            </widget>
-           </item>
-          </layout>
-         </widget>
-         <property name="stretch">
-          <number>1</number>
-         </property>
-        </item>
+              <column>
+               <property name="text">
+                <string>Propiedad</string>
+               </property>
+              </column>
+              <column>
+               <property name="text">
+                <string>Valor</string>
+               </property>
+              </column>
+             </widget>
+            </item>
+           </layout>
+          </widget>
 
+         </widget>
+        </item>
        </layout>
       </widget>
      </widget>

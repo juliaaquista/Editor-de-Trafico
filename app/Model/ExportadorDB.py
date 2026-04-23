@@ -35,8 +35,9 @@ class ExportadorDB:
         rutas_a_generar.append(os.path.join(carpeta, "puntos.db"))
         rutas_a_generar.append(os.path.join(carpeta, "rutas.db"))
 
-        # Objetivos (solo si hay nodos con objetivo != 0)
-        if any(n.get("objetivo", 0) != 0 for n in proyecto.nodos):
+        # Objetivos (solo si hay nodos con objetivo real: 1..4).
+        # "Paso" (5) no genera línea en objetivos.db.
+        if any(n.get("objetivo", 0) not in (0, 5) for n in proyecto.nodos):
             rutas_a_generar.append(os.path.join(carpeta, "objetivos.db"))
 
         # Parámetros de playa
@@ -136,7 +137,8 @@ class ExportadorDB:
                     else:
                         datos = nodo
 
-                    if datos.get('objetivo', 0) != 0:
+                    # "Paso" (5) no genera línea en objetivos.db
+                    if datos.get('objetivo', 0) not in (0, 5):
                         valores = [datos.get('id')]
                         for key, info in OBJETIVO_FIELDS.items():
                             valor = datos.get(key, info['default'])
@@ -317,7 +319,7 @@ class ExportadorDB:
                     conn_carga.close()
 
             # Mostrar mensaje de éxito
-            nodos_con_objetivo = sum(1 for n in proyecto.nodos if n.get("objetivo", 0) != 0)
+            nodos_con_objetivo = sum(1 for n in proyecto.nodos if n.get("objetivo", 0) not in (0, 5))
             archivos_creados = [
                 f"• {os.path.basename(rutas_a_generar[0])} ({len(proyecto.nodos)} nodos)",
                 f"• {os.path.basename(rutas_a_generar[1])} ({len(proyecto.rutas)} rutas)"

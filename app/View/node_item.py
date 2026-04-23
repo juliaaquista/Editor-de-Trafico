@@ -17,7 +17,7 @@ class NodoItem(QGraphicsObject):
     hover_entered = pyqtSignal(object)
     hover_leaved = pyqtSignal(object)
 
-    def __init__(self, nodo: Nodo, size=70, editor=None):
+    def __init__(self, nodo: Nodo, size=35, editor=None):
         super().__init__()
         self.nodo = nodo
         self.size = size
@@ -58,6 +58,11 @@ class NodoItem(QGraphicsObject):
         self.color_selected = QColor(255, 255, 255)
         self.color_route_selected = QColor(255, 165, 0)
         self.border_color = Qt.black
+        self.border_width = 2
+        # Flag para marcado durante el modo "Duplicar nodo" (borde naranja)
+        self._marcado_duplicar = False
+        # Flag para cuando el nodo pertenece a la ruta actualmente seleccionada (borde amarillo)
+        self._en_ruta_seleccionada = False
 
     @classmethod
     def limpiar_cache_iconos(cls):
@@ -233,31 +238,33 @@ class NodoItem(QGraphicsObject):
     # VISUALIZACIÓN Y EVENTOS
     # -------------------------------------------------------------------------
 
+    # Colores por tipo de objetivo
+    COLORES_OBJETIVO = {
+        0: QColor(0, 120, 215),    # Azul - Normal
+        1: QColor(220, 40, 40),    # Rojo - Dejada
+        2: QColor(0, 180, 60),     # Verde - Cogida
+        3: QColor(150, 0, 200),    # Morado - I/O
+        4: QColor(230, 130, 0),    # Naranja - Cargador
+        5: QColor(0, 0, 0),        # Negro - Paso
+    }
+
+    ETIQUETAS_OBJETIVO = {
+        0: "",           # Normal: solo número
+        1: "",           # Dejada: solo color
+        2: "",           # Cogida: solo color
+        3: "",           # I/O: solo color
+        5: "",           # Paso: solo color
+    }
+
     def _determinar_visualizacion(self):
-        if self.es_cargador != 0:
-            self.mostrar_icono = True
-            self.icono_actual = self._cargador_pixmap
-            return
-
-        if self.objetivo == 1:
-            self.mostrar_icono = True
-            self.icono_actual = self._cargar_pixmap
-            return
-
-        if self.objetivo == 2:
-            self.mostrar_icono = True
-            self.icono_actual = self._descargar_pixmap
-            return
-
-        if self.objetivo == 3:
-            self.mostrar_icono = True
-            self.icono_actual = self._cargador_io_pixmap
-            return
-
         self.mostrar_icono = False
-        self.color_default = QColor(0, 120, 215)
-        self.texto = str(self.nodo.get('id', ''))
         self.con_horquilla = True
+        nodo_id = str(self.nodo.get('id', ''))
+
+        objetivo = int(self.objetivo) if self.objetivo is not None else 0
+        self.color_default = self.COLORES_OBJETIVO.get(objetivo, self.COLORES_OBJETIVO[0])
+        self.etiqueta_tipo = self.ETIQUETAS_OBJETIVO.get(objetivo, "")
+        self.texto = nodo_id
 
     def boundingRect(self):
         extra_margin = 10
@@ -280,78 +287,92 @@ class NodoItem(QGraphicsObject):
         painter.rotate(360 - angle)
         painter.translate(-self.size / 2, -self.size / 2)
 
-        if self.mostrar_icono and self.icono_actual:
-            icon_size = self.icono_actual.width()
-            x = (self.size - icon_size) / 2
-            y = (self.size - icon_size) / 2
+        # Siempre dibujar círculo con color (borde más grueso si seleccionado)
+        painter.setBrush(QBrush(self.color_default))
+        borde = 4 if self.isSelected() else 2
+        color_borde = Qt.black
+        # Si el nodo pertenece a la ruta seleccionada, borde amarillo
+        if getattr(self, "_en_ruta_seleccionada", False):
+            color_borde = QColor(255, 215, 0)
+            borde = 4
+        # Si está marcado para duplicar, borde naranja (tiene prioridad)
+        if getattr(self, "_marcado_duplicar", False):
+            color_borde = QColor(255, 140, 0)
+            borde = 5
+        painter.setPen(QPen(color_borde, borde))
+        circle_rect = self.boundingRect().adjusted(margin, margin, -margin, -margin)
+        painter.drawEllipse(circle_rect)
 
-            icon_rect = QRectF(x, y, icon_size, icon_size)
+        if self.con_horquilla:
+            center_y = self.size / 2
+            fork_length = 7.5
+            fork_gap = 3
+            offset_from_node = 6.75
 
-            painter.drawPixmap(
-                icon_rect,
-                self.icono_actual,
-                QRectF(0, 0, self.icono_actual.width(), self.icono_actual.height())
-            )
+            x_start = margin - offset_from_node
+            x_end = x_start - fork_length
 
-        else:
-            painter.setBrush(QBrush(self.color_default))
-            painter.setPen(QPen(self.border_color, 2))
-            painter.drawEllipse(self.boundingRect().adjusted(margin, margin, -margin, -margin))
+            y_top = center_y - fork_gap / 2
+            y_bottom = center_y + fork_gap / 2
 
-            if self.con_horquilla:
-                center_y = self.size / 2
-                fork_length = 15
-                fork_gap = 6
-                offset_from_node = 13.5
+            pen = QPen(Qt.black, 1, Qt.SolidLine, Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(x_start, y_top), QPointF(x_end, y_top))
+            painter.drawLine(QPointF(x_start, y_bottom), QPointF(x_end, y_bottom))
 
-                x_start = margin - offset_from_node
-                x_end = x_start - fork_length
+        # Texto: número del nodo
+        font = QFont()
+        font.setPointSize(5)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QPen(Qt.white, 1))
 
-                y_top = center_y - fork_gap / 2
-                y_bottom = center_y + fork_gap / 2
+        etiqueta = getattr(self, 'etiqueta_tipo', '')
+        if etiqueta:
+            # Dibujar número arriba y etiqueta abajo
+            text_rect_top = QRectF(circle_rect.x(), circle_rect.y(),
+                                   circle_rect.width(), circle_rect.height() / 2)
+            text_rect_bottom = QRectF(circle_rect.x(), circle_rect.y() + circle_rect.height() / 2,
+                                      circle_rect.width(), circle_rect.height() / 2)
+            font_small = QFont()
+            font_small.setPointSize(3)
+            font_small.setBold(True)
 
-                pen = QPen(Qt.black, 2, Qt.SolidLine, Qt.RoundCap)
-                painter.setPen(pen)
-                painter.drawLine(QPointF(x_start, y_top), QPointF(x_end, y_top))
-                painter.drawLine(QPointF(x_start, y_bottom), QPointF(x_end, y_bottom))
-
-            font = QFont()
-            font.setPointSize(9)
-            font.setBold(True)
             painter.setFont(font)
+            painter.drawText(text_rect_top, Qt.AlignCenter | Qt.AlignBottom, self.texto)
+            painter.setFont(font_small)
+            painter.drawText(text_rect_bottom, Qt.AlignCenter | Qt.AlignTop, etiqueta)
+        else:
+            painter.drawText(circle_rect, Qt.AlignCenter, self.texto)
 
-            text_rect = self.boundingRect().adjusted(margin, margin, -margin, -margin)
-            painter.setPen(QPen(Qt.white, 1))
-            painter.drawText(text_rect, Qt.AlignCenter, self.texto)
-
-        if self.isSelected():
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(self.color_selected, 3))
-            if self.mostrar_icono:
-                icon_size = self.icono_actual.width()
-                x = (self.size - icon_size) / 2
-                y = (self.size - icon_size) / 2
-                painter.drawEllipse(QRectF(x, y, icon_size, icon_size))
-            else:
-                painter.drawEllipse(self.boundingRect().adjusted(margin + 2, margin + 2,
-                                                                 -margin - 2, -margin - 2))
+        # Ya no se dibuja segundo anillo, la selección se indica con borde más grueso
 
         painter.restore()
 
         
     def set_selected_color(self):
-        """Cambia al color de selección (borde blanco)"""
-        self.border_color = self.color_selected
+        """Cambia al color de selección (borde negro grueso)"""
+        self.border_color = Qt.black
+        self.border_width = 4
         self.update()
 
     def set_route_selected_color(self):
-        """Cambia al color para nodos en ruta seleccionada (borde naranja)"""
+        """Cambia al color para nodos en ruta seleccionada (borde amarillo grueso)"""
         self.border_color = self.color_route_selected
+        self.border_width = 4
+        self._en_ruta_seleccionada = True
         self.update()
 
     def set_normal_color(self):
-        """Vuelve al color normal (borde negro)"""
+        """Vuelve al color normal (borde negro fino)"""
         self.border_color = Qt.black
+        self.border_width = 2
+        self._en_ruta_seleccionada = False
+        self.update()
+
+    def set_marcado_duplicar(self, marcado: bool):
+        """Activa/desactiva el indicador de 'marcado para duplicar' (borde naranja)."""
+        self._marcado_duplicar = bool(marcado)
         self.update()
 
     def actualizar_posicion(self):
@@ -371,12 +392,11 @@ class NodoItem(QGraphicsObject):
         
         # Re-determinar visualización
         self._determinar_visualizacion()
+        self.border_color = Qt.black
         self.update()
 
 
     def mousePressEvent(self, event):
-        print(f"MousePress en nodo {self.nodo.get('id')}")
-        
         # Marcar inicio de arrastre si el item es movible
         if event.button() == Qt.LeftButton and (self.flags() & QGraphicsObject.ItemIsMovable):
             self._dragging = True
@@ -388,7 +408,6 @@ class NodoItem(QGraphicsObject):
             
             # Notificar al editor que se inició el arrastre
             if self.editor:
-                print("Llamando a nodo_arrastre_iniciado")
                 self.editor.nodo_arrastre_iniciado()
             
             # También para el historial
@@ -419,15 +438,25 @@ class NodoItem(QGraphicsObject):
                 new_pos = value
                 cx = int(new_pos.x() + self.size / 2)
                 cy = int(new_pos.y() + self.size / 2)
-                
-                # DEBUG: Verificar estructura del nodo
-                if hasattr(self.nodo, "__dict__"):
-                    print(f"DEBUG NodoItem: nodo es objeto con id={getattr(self.nodo, 'id', 'NO ID')}")
-                elif isinstance(self.nodo, dict):
-                    print(f"DEBUG NodoItem: nodo es dict con id={self.nodo.get('id', 'NO ID')}")
-                else:
-                    print(f"DEBUG NodoItem: nodo tipo={type(self.nodo)}")
-                
+
+                # Mover otros nodos seleccionados juntos
+                if self._dragging and self.scene():
+                    old_pos = self.pos()
+                    dx = new_pos.x() - old_pos.x()
+                    dy = new_pos.y() - old_pos.y()
+                    if dx != 0 or dy != 0:
+                        for item in self.scene().selectedItems():
+                            if isinstance(item, NodoItem) and item is not self:
+                                item_pos = item.pos()
+                                item.setPos(item_pos.x() + dx, item_pos.y() + dy)
+                                # Actualizar modelo del otro nodo
+                                other_cx = int(item.pos().x() + item.size / 2)
+                                other_cy = int(item.pos().y() + item.size / 2)
+                                if isinstance(item.nodo, dict):
+                                    item.nodo["X"] = other_cx
+                                    item.nodo["Y"] = other_cy
+                                item.moved.emit(item)
+
                 # Actualizar modelo temporalmente durante el arrastre
                 if hasattr(self.nodo, "set_posicion"):
                     self.nodo.set_posicion(cx, cy)
@@ -436,22 +465,18 @@ class NodoItem(QGraphicsObject):
                     if isinstance(self.nodo, dict):
                         self.nodo["X"] = cx
                         self.nodo["Y"] = cy
-                        print(f"DEBUG NodoItem: Actualizado dict nodo {self.nodo.get('id')} a ({cx}, {cy})")
                     else:
                         # Si es un objeto Nodo, usar update
                         self.nodo.update({"X": cx, "Y": cy})
-                        print(f"DEBUG NodoItem: Actualizado objeto nodo con update")
                 else:
                     # Fallback: intentar establecer directamente
                     try:
                         setattr(self.nodo, "X", cx)
                         setattr(self.nodo, "Y", cy)
-                        print(f"DEBUG NodoItem: Actualizado con setattr")
-                    except:
+                    except Exception:
                         pass
-                
+
                 # EMITIR SEÑAL DURANTE EL ARRASTRE - ESTO ES CLAVE
-                print(f"DEBUG NodoItem: Emitiendo moved para nodo_item")
                 self.moved.emit(self)
                 return value
                 
@@ -460,8 +485,6 @@ class NodoItem(QGraphicsObject):
                 p = self.scenePos()
                 cx = int(p.x() + self.size / 2)
                 cy = int(p.y() + self.size / 2)
-                
-                print(f"DEBUG NodoItem: ItemPositionHasChanged - posición final ({cx}, {cy})")
                 
                 # Actualizar modelo
                 if hasattr(self.nodo, "set_posicion"):
@@ -477,13 +500,14 @@ class NodoItem(QGraphicsObject):
                 self.moved.emit(self)
                 
             return super().itemChange(change, value)
-        except Exception as err:
-            print("Error en itemChange:", err)
-            return super().itemChange(change, value)
+        except (RuntimeError, Exception) as err:
+            # El objeto C++ puede haber sido eliminado
+            try:
+                return super().itemChange(change, value)
+            except RuntimeError:
+                return value
     
     def mouseReleaseEvent(self, event):
-        print(f"MouseRelease en nodo {self.nodo.get('id')}")
-        
         try:
             if self._dragging and self._posicion_inicial:
                 p = self.scenePos()
@@ -504,8 +528,7 @@ class NodoItem(QGraphicsObject):
             self._dragging = False
             # CRÍTICO: Notificar al editor que terminó el arrastre
             if self.editor:
-                print("Llamando a nodo_arrastre_terminado desde mouseReleaseEvent")
-                # Forzar la actualización del cursor
+                # Actualizar el cursor
                 self.editor._arrastrando_nodo = False
                 # Primero actualizar estado hover
                 pos = event.scenePos()
@@ -518,7 +541,6 @@ class NodoItem(QGraphicsObject):
     
     def hoverEnterEvent(self, event):
         """Cuando el ratón entra en el nodo"""
-        print(f"HoverEnter en nodo {self.nodo.get('id')}")
         if self.editor:
             self.editor.nodo_hover_entered(self)
         self.hover_entered.emit(self)
@@ -526,8 +548,6 @@ class NodoItem(QGraphicsObject):
 
     def hoverLeaveEvent(self, event):
         """Cuando el ratón sale del nodo - MEJORADO"""
-        print(f"HoverLeave en nodo {self.nodo.get('id')}")
-        
         # Solo procesar si no estamos arrastrando
         if not self._dragging:
             if self.editor:
@@ -541,10 +561,8 @@ class NodoItem(QGraphicsObject):
                 if len(nodos_bajo_cursor) == 0:
                     # Realmente salió de todos los nodos
                     self.editor._cursor_sobre_nodo = False
-                    print(f"Cursor realmente salió de nodo {self.nodo.get('id')}")
                 else:
                     # Todavía está sobre otro nodo (superposición)
-                    print(f"Cursor sigue sobre {len(nodos_bajo_cursor)} nodos")
                     self.editor._cursor_sobre_nodo = True
             
             self.hover_leaved.emit(self)

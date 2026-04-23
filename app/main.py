@@ -1,7 +1,14 @@
 import sys
 import os
+import io
 import traceback
 from pathlib import Path
+
+# Forzar UTF-8 en stdout/stderr para Windows (evita errores con caracteres especiales)
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QFile, QTextStream
 from PyQt5.QtGui import QFont
@@ -116,7 +123,14 @@ def main():
         # Mostrar ventana
         print("Mostrando ventana...")
         view.show()
-        
+
+        # Si se recibió un archivo .json como argumento, abrirlo automáticamente
+        if len(sys.argv) > 1 and sys.argv[1].lower().endswith(".json"):
+            ruta_proyecto = sys.argv[1]
+            if os.path.isfile(ruta_proyecto):
+                print(f"Abriendo proyecto desde argumento: {ruta_proyecto}")
+                controller.abrir_proyecto_desde_ruta(ruta_proyecto)
+
         # Mensaje de éxito
         print("="*50)
         print("APLICACIÓN INICIADA CORRECTAMENTE")

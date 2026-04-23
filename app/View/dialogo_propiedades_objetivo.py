@@ -94,7 +94,14 @@ class DialogoPropiedadesObjetivo(QDialog):
         
         if propiedades is None:
             propiedades = {}
-        
+
+        # Tipo de objetivo actual (para validaciones condicionales: Cargador=4)
+        try:
+            self._objetivo = int(propiedades.get("objetivo", 0))
+        except (TypeError, ValueError):
+            self._objetivo = 0
+        self._cancelado = False
+
         # Diccionario para almacenar los widgets dinámicos
         self.widgets = {}
         
@@ -197,6 +204,28 @@ class DialogoPropiedadesObjetivo(QDialog):
             grupo_otros.setLayout(form_otros)
             scroll_layout.addWidget(grupo_otros)
         
+        # --- GRUPO CARGADOR: sólo para objetivo = 4 (Cargador) ---
+        # Campo "Cargador (ID)" obligatorio != 0; se guarda en es_cargador.
+        self.spin_cargador = QSpinBox()
+        self.spin_cargador.setRange(0, 100000)
+        try:
+            es_cargador_actual = int(propiedades.get("es_cargador", 0))
+        except (TypeError, ValueError):
+            es_cargador_actual = 0
+        self.spin_cargador.setValue(es_cargador_actual)
+
+        if self._objetivo == 4:
+            grupo_cargador = QGroupBox("Cargador")
+            layout_cargador = QFormLayout()
+            layout_cargador.setLabelAlignment(Qt.AlignRight)
+            layout_cargador.setSpacing(8)
+            layout_cargador.setContentsMargins(10, 15, 10, 10)
+            lbl_c = QLabel("Cargador (ID):")
+            lbl_c.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            layout_cargador.addRow(lbl_c, self.spin_cargador)
+            grupo_cargador.setLayout(layout_cargador)
+            scroll_layout.addWidget(grupo_cargador)
+
         scroll.setWidget(scroll_content)
         layout_principal.addWidget(scroll)
         
@@ -212,16 +241,41 @@ class DialogoPropiedadesObjetivo(QDialog):
         self.btn_aceptar = QPushButton("Aceptar")
         self.btn_cancelar = QPushButton("Cancelar")
         self.btn_aceptar.setDefault(True)
-        self.btn_aceptar.clicked.connect(self.accept)
-        self.btn_cancelar.clicked.connect(self.reject)
+        self.btn_aceptar.clicked.connect(self._validar_y_aceptar)
+        self.btn_cancelar.clicked.connect(self._cancelar)
         botones_layout.addWidget(self.btn_aceptar)
         botones_layout.addWidget(self.btn_cancelar)
         layout_principal.addLayout(botones_layout)
-        
+
+        # Estilos de validación
+        self._estilo_normal_spin = (
+            "QSpinBox { background-color: #4a4a4a; color: white; "
+            "border: 1px solid #6a6a6a; }"
+        )
+        self._estilo_error_spin = (
+            "QSpinBox { background-color: #4a4a4a; color: white; "
+            "border: 2px solid #DC2828; }"
+        )
+
         self.setLayout(layout_principal)
-    
+
+    def _cancelar(self):
+        """Cancelar: marcar flag para que el controlador revierta el objetivo."""
+        self._cancelado = True
+        self.reject()
+
+    def _validar_y_aceptar(self):
+        """Valida el campo Cargador (ID) obligatorio != 0 cuando objetivo=4."""
+        # Reset estilos
+        self.spin_cargador.setStyleSheet(self._estilo_normal_spin)
+        if self._objetivo == 4 and self.spin_cargador.value() == 0:
+            self.spin_cargador.setStyleSheet(self._estilo_error_spin)
+            return
+        self.accept()
+
     def obtener_propiedades(self):
-        """Devuelve un diccionario con los valores actuales de todos los widgets"""
+        """Devuelve un diccionario con los valores actuales de todos los widgets.
+        Para objetivo=4 (Cargador) incluye el ID en es_cargador."""
         resultado = {}
         for clave, widget in self.widgets.items():
             if isinstance(widget, QSpinBox):
@@ -231,4 +285,6 @@ class DialogoPropiedadesObjetivo(QDialog):
             else:
                 valor = widget.text()
             resultado[clave] = valor
+        if self._objetivo == 4:
+            resultado["es_cargador"] = self.spin_cargador.value()
         return resultado

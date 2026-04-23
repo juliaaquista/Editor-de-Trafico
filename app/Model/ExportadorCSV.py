@@ -28,8 +28,9 @@ class ExportadorCSV:
         rutas_a_generar.append(os.path.join(carpeta, "puntos.csv"))
         rutas_a_generar.append(os.path.join(carpeta, "rutas.csv"))
 
-        # Objetivos (solo si hay nodos con objetivo != 0)
-        if any(n.get("objetivo", 0) != 0 for n in proyecto.nodos):
+        # Objetivos (solo si hay nodos con objetivo real: 1..4).
+        # "Paso" (5) se escribe en puntos.csv pero NO genera línea en objetivos.csv.
+        if any(n.get("objetivo", 0) not in (0, 5) for n in proyecto.nodos):
             rutas_a_generar.append(os.path.join(carpeta, "objetivos.csv"))
 
         # Parámetros de playa
@@ -101,7 +102,8 @@ class ExportadorCSV:
                         else:
                             datos = nodo
 
-                        if datos.get('objetivo', 0) != 0:
+                        # "Paso" (5) no genera línea en objetivos.csv
+                        if datos.get('objetivo', 0) not in (0, 5):
                             fila = {'nodo_id': datos.get('id')}
                             for key, info in OBJETIVO_FIELDS.items():
                                 col_name = info.get('csv_name', key)
@@ -198,7 +200,7 @@ class ExportadorCSV:
                             writer.writerow(fila)
 
             # Mostrar mensaje de éxito
-            nodos_con_objetivo = sum(1 for n in proyecto.nodos if n.get("objetivo", 0) != 0)
+            nodos_con_objetivo = sum(1 for n in proyecto.nodos if n.get("objetivo", 0) not in (0, 5))
             archivos_creados = [
                 f"• puntos.csv ({len(proyecto.nodos)} nodos)",
                 f"• rutas.csv ({len(proyecto.rutas)} rutas)"

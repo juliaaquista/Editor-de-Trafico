@@ -13,8 +13,8 @@ class DialogoParametrosPlaya(QDialog):
         
         # Propiedades base (fijas)
         self.propiedades_base = [
-            "ID", "Vertical", "Columnas", "Filas", "Pose_num",
-            "Detectar_con_lidar_seguirdad", "Id_col", "Id_row", "ref_final"
+            "ID", "vertical", "Columnas", "Filas", "Pose_num",
+            "Detectar_con_lidar_seguridad", "id_col", "id_row", "ref_final"
         ]
         
         # Propiedades personalizadas (dinámicas)
@@ -117,13 +117,13 @@ class DialogoParametrosPlaya(QDialog):
             # Un solo conjunto por defecto
             self.parametros_playa = [{
                 "ID": 1,
-                "Vertical": 0,
+                "vertical": 0,
                 "Columnas": 10,
                 "Filas": 10,
                 "Pose_num": 0,
-                "Detectar_con_lidar_seguirdad": 0,
-                "Id_col": 1,
-                "Id_row": 1,
+                "Detectar_con_lidar_seguridad": 0,
+                "id_col": 1,
+                "id_row": 1,
                 "ref_final": 0
             }]
         
@@ -220,13 +220,13 @@ class DialogoParametrosPlaya(QDialog):
         # Configurar valores por defecto
         valores_por_defecto = {
             "ID": str(max_id + 1),
-            "Vertical": "0",
+            "vertical": "0",
             "Columnas": "10",
             "Filas": "10",
             "Pose_num": "0",
-            "Detectar_con_lidar_seguirdad": "0",
-            "Id_col": "1",
-            "Id_row": "1",
+            "Detectar_con_lidar_seguridad": "0",
+            "id_col": "1",
+            "id_row": "1",
             "ref_final": "0"
         }
         
@@ -286,8 +286,8 @@ class DialogoParametrosPlaya(QDialog):
                     if valor:
                         # Convertir a número si es posible
                         try:
-                            if propiedad in ["Vertical", "Columnas", "Filas", "Pose_num", 
-                                           "Detectar_con_lidar_seguirdad", "Id_col", "Id_row", "ref_final"]:
+                            if propiedad in ["vertical", "Columnas", "Filas", "Pose_num", 
+                                           "Detectar_con_lidar_seguridad", "id_col", "id_row", "ref_final"]:
                                 playa[propiedad] = int(valor)
                             else:
                                 playa[propiedad] = valor
@@ -299,9 +299,9 @@ class DialogoParametrosPlaya(QDialog):
                         # Valor vacío, usar valor por defecto para propiedades base
                         if propiedad in ["Columnas", "Filas"]:
                             playa[propiedad] = 10
-                        elif propiedad in ["Id_col", "Id_row"]:
+                        elif propiedad in ["id_col", "id_row"]:
                             playa[propiedad] = 1
-                        elif propiedad in ["Vertical", "Pose_num", "Detectar_con_lidar_seguirdad", "ref_final"]:
+                        elif propiedad in ["vertical", "Pose_num", "Detectar_con_lidar_seguridad", "ref_final"]:
                             playa[propiedad] = 0
                         else:
                             playa[propiedad] = ""  # Otras propiedades base vacías

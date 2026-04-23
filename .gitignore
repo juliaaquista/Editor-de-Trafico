@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtualenvs
+venv/
+.venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Proyectos de prueba / mapas del cliente (no deben ir al repo)
+/prueba*.json
+/cabezuelo_09.png
+/cabezuelo_09.stcm
+/cabezuelo_09_map.png
+/cabezuelo_09_map.stcm
+/map_26.png
+/map_26.stcm
